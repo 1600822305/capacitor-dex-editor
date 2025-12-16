@@ -1,0 +1,3724 @@
+package com.aetherlink.dexeditor;
+
+import android.util.Log;
+
+import com.getcapacitor.JSArray;
+import com.getcapacitor.JSObject;
+
+import com.android.tools.smali.dexlib2.DexFileFactory;
+import com.android.tools.smali.dexlib2.Opcodes;
+import com.android.tools.smali.dexlib2.rewriter.DexRewriter;
+import com.android.tools.smali.dexlib2.rewriter.Rewriter;
+import com.android.tools.smali.dexlib2.rewriter.RewriterModule;
+import com.android.tools.smali.dexlib2.rewriter.Rewriters;
+import com.android.tools.smali.dexlib2.dexbacked.DexBackedClassDef;
+import com.android.tools.smali.dexlib2.dexbacked.DexBackedDexFile;
+import com.android.tools.smali.dexlib2.dexbacked.DexBackedField;
+import com.android.tools.smali.dexlib2.dexbacked.DexBackedMethod;
+import com.android.tools.smali.dexlib2.iface.ClassDef;
+import com.android.tools.smali.dexlib2.iface.DexFile;
+import com.android.tools.smali.dexlib2.iface.Field;
+import com.android.tools.smali.dexlib2.iface.Method;
+import com.android.tools.smali.dexlib2.iface.MethodImplementation;
+import com.android.tools.smali.dexlib2.iface.instruction.Instruction;
+import com.android.tools.smali.dexlib2.immutable.ImmutableClassDef;
+import com.android.tools.smali.dexlib2.immutable.ImmutableDexFile;
+import com.android.tools.smali.dexlib2.immutable.ImmutableField;
+import com.android.tools.smali.dexlib2.immutable.ImmutableMethod;
+import com.android.tools.smali.dexlib2.writer.io.FileDataStore;
+import com.android.tools.smali.dexlib2.writer.pool.DexPool;
+import com.android.tools.smali.baksmali.Baksmali;
+import com.android.tools.smali.baksmali.BaksmaliOptions;
+import com.android.tools.smali.baksmali.Adaptors.ClassDefinition;
+import com.android.tools.smali.baksmali.formatter.BaksmaliWriter;
+import com.android.tools.smali.smali.Smali;
+import com.android.tools.smali.smali.SmaliOptions;
+
+import org.json.JSONArray;
+
+import java.io.BufferedWriter;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.io.StringWriter;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import java.util.regex.Pattern;
+
+/**
+ * DexManager - 封装 dexlib2 全部功能
+ * 管理多个 DEX 会话，支持加载、编辑、保存 DEX 文件
+ */
+public class DexManager {
+
+    private static final String TAG = "DexManager";
+    
+    /**
+     * 编译进度回调接口
+     */
+    public interface CompileProgress {
+        void onProgress(int current, int total);
+        void onMessage(String message);
+        void onTitle(String title);
+    }
+    
+    // 当前进度回调
+    private CompileProgress progressCallback;
+    
+    public void setProgressCallback(CompileProgress callback) {
+        this.progressCallback = callback;
+    }
+    
+    private void reportProgress(int current, int total) {
+        if (progressCallback != null) {
+            progressCallback.onProgress(current, total);
+        }
+    }
+    
+    private void reportMessage(String message) {
+        if (progressCallback != null) {
+            progressCallback.onMessage(message);
+        }
+    }
+    
+    private void reportTitle(String title) {
+        if (progressCallback != null) {
+            progressCallback.onTitle(title);
+        }
+    }
+    
+    // 存储活跃的 DEX 会话
+    private final Map<String, DexSession> sessions = new HashMap<>();
+    
+    // 存储多 DEX 会话（MCP 工作流）
+    private final Map<String, MultiDexSession> multiDexSessions = new HashMap<>();
+    
+    // APK DEX 缓存 - 用于加速编译（key: apkPath + ":" + dexPath）
+    private final Map<String, ApkDexCache> apkDexCaches = new HashMap<>();
+    
+    /**
+     * APK DEX 缓存 - 缓存从 APK 读取的 DEX 数据和 ClassDef
+     */
+    private static class ApkDexCache {
+        String apkPath;
+        String dexPath;
+        long lastModified;
+        Map<String, ClassDef> classDefMap; // type -> ClassDef
+        int dexVersion;
+        
+        ApkDexCache(String apkPath, String dexPath) {
+            this.apkPath = apkPath;
+            this.dexPath = dexPath;
+            this.classDefMap = new HashMap<>();
+        }
+        
+        String getCacheKey() {
+            return apkPath + ":" + dexPath;
+        }
+    }
+
+    /**
+     * DEX 会话 - 存储加载的 DEX 文件及其修改状态
+     */
+    private static class DexSession {
+        String sessionId;
+        String filePath;
+        DexBackedDexFile originalDexFile;
+        List<ClassDef> modifiedClasses;
+        Set<String> removedClasses;
+        boolean modified = false;
+
+        DexSession(String sessionId, String filePath, DexBackedDexFile dexFile) {
+            this.sessionId = sessionId;
+            this.filePath = filePath;
+            this.originalDexFile = dexFile;
+            this.modifiedClasses = new ArrayList<>();
+            this.removedClasses = new HashSet<>();
+        }
+    }
+
+    /**
+     * 多 DEX 会话 - 用于 MCP 工作流，支持同时编辑多个 DEX 文件
+     */
+    private static class MultiDexSession {
+        String sessionId;
+        String apkPath;
+        Map<String, DexBackedDexFile> dexFiles;
+        Map<String, ClassDef> modifiedClasses;
+        boolean modified = false;
+
+        MultiDexSession(String sessionId, String apkPath) {
+            this.sessionId = sessionId;
+            this.apkPath = apkPath;
+            this.dexFiles = new HashMap<>();
+            this.modifiedClasses = new HashMap<>();
+        }
+
+        void addDex(String dexName, DexBackedDexFile dexFile) {
+            this.dexFiles.put(dexName, dexFile);
+        }
+    }
+
+    // ==================== DEX 文件操作 ====================
+
+    /**
+     * 加载 DEX 文件
+     */
+    public JSObject loadDex(String path, String sessionId) throws Exception {
+        if (path == null || path.isEmpty()) {
+            throw new IllegalArgumentException("Path is required");
+        }
+
+        File file = new File(path);
+        if (!file.exists()) {
+            throw new IOException("File not found: " + path);
+        }
+
+        // 生成或使用提供的 sessionId
+        String sid = (sessionId != null && !sessionId.isEmpty()) ? sessionId : UUID.randomUUID().toString();
+
+        // 加载 DEX 文件 (使用官方推荐的 DexFileFactory)
+        DexBackedDexFile dexFile = (DexBackedDexFile) DexFileFactory.loadDexFile(
+            file, 
+            Opcodes.getDefault()
+        );
+
+        // 创建会话
+        DexSession session = new DexSession(sid, path, dexFile);
+        sessions.put(sid, session);
+
+        Log.d(TAG, "Loaded DEX: " + path + " with session: " + sid);
+
+        JSObject result = new JSObject();
+        result.put("sessionId", sid);
+        result.put("classCount", dexFile.getClasses().size());
+        result.put("dexVersion", dexFile.getOpcodes().api);
+        return result;
+    }
+
+    /**
+     * 保存 DEX 文件
+     */
+    public void saveDex(String sessionId, String outputPath) throws Exception {
+        DexSession session = getSession(sessionId);
+
+        // 创建新的 DEX 文件
+        DexPool dexPool = new DexPool(session.originalDexFile.getOpcodes());
+
+        // 添加所有类（排除已删除的，使用修改后的版本）
+        Set<String> modifiedClassTypes = new HashSet<>();
+        for (ClassDef modifiedClass : session.modifiedClasses) {
+            modifiedClassTypes.add(modifiedClass.getType());
+            dexPool.internClass(modifiedClass);
+        }
+
+        for (ClassDef classDef : session.originalDexFile.getClasses()) {
+            String type = classDef.getType();
+            if (!session.removedClasses.contains(type) && !modifiedClassTypes.contains(type)) {
+                dexPool.internClass(classDef);
+            }
+        }
+
+        // 写入文件 (使用官方推荐方式)
+        File outputFile = new File(outputPath);
+        if (outputFile.getParentFile() != null) {
+            outputFile.getParentFile().mkdirs();
+        }
+        
+        // 创建临时 DexFile 用于写入
+        List<ClassDef> allClasses = new ArrayList<>();
+        for (ClassDef c : session.modifiedClasses) {
+            allClasses.add(c);
+        }
+        for (ClassDef c : session.originalDexFile.getClasses()) {
+            if (!session.removedClasses.contains(c.getType()) && !modifiedClassTypes.contains(c.getType())) {
+                allClasses.add(c);
+            }
+        }
+        
+        ImmutableDexFile newDexFile = new ImmutableDexFile(session.originalDexFile.getOpcodes(), allClasses);
+        DexFileFactory.writeDexFile(outputPath, newDexFile);
+
+        Log.d(TAG, "Saved DEX to: " + outputPath);
+    }
+
+    /**
+     * 关闭 DEX 会话
+     */
+    public void closeDex(String sessionId) {
+        sessions.remove(sessionId);
+        Log.d(TAG, "Closed session: " + sessionId);
+    }
+
+    /**
+     * 获取 DEX 文件信息
+     */
+    public JSObject getDexInfo(String sessionId) throws Exception {
+        DexSession session = getSession(sessionId);
+        DexBackedDexFile dexFile = session.originalDexFile;
+
+        JSObject info = new JSObject();
+        info.put("sessionId", sessionId);
+        info.put("filePath", session.filePath);
+        info.put("classCount", dexFile.getClasses().size());
+        
+        // 统计方法和字段数量
+        int methodCount = 0;
+        int fieldCount = 0;
+        for (ClassDef classDef : dexFile.getClasses()) {
+            for (Method ignored : classDef.getMethods()) methodCount++;
+            for (Field ignored : classDef.getFields()) fieldCount++;
+        }
+        info.put("methodCount", methodCount);
+        info.put("fieldCount", fieldCount);
+        info.put("dexVersion", dexFile.getOpcodes().api);
+        info.put("modified", session.modified);
+        return info;
+    }
+
+    // ==================== 类操作 ====================
+
+    /**
+     * 获取所有类列表
+     */
+    public JSArray getClasses(String sessionId) throws Exception {
+        DexSession session = getSession(sessionId);
+        JSArray classes = new JSArray();
+
+        for (ClassDef classDef : session.originalDexFile.getClasses()) {
+            if (!session.removedClasses.contains(classDef.getType())) {
+                JSObject classInfo = new JSObject();
+                classInfo.put("type", classDef.getType());
+                classInfo.put("accessFlags", classDef.getAccessFlags());
+                classInfo.put("superclass", classDef.getSuperclass());
+                classes.put(classInfo);
+            }
+        }
+
+        return classes;
+    }
+
+    /**
+     * 获取类详细信息
+     */
+    public JSObject getClassInfo(String sessionId, String className) throws Exception {
+        DexSession session = getSession(sessionId);
+        ClassDef classDef = findClass(session, className);
+
+        if (classDef == null) {
+            throw new IllegalArgumentException("Class not found: " + className);
+        }
+
+        JSObject info = new JSObject();
+        info.put("type", classDef.getType());
+        info.put("accessFlags", classDef.getAccessFlags());
+        info.put("superclass", classDef.getSuperclass());
+
+        // 接口
+        JSArray interfaces = new JSArray();
+        for (String iface : classDef.getInterfaces()) {
+            interfaces.put(iface);
+        }
+        info.put("interfaces", interfaces);
+
+        // 方法数量
+        int methodCount = 0;
+        for (Method ignored : classDef.getMethods()) {
+            methodCount++;
+        }
+        info.put("methodCount", methodCount);
+
+        // 字段数量
+        int fieldCount = 0;
+        for (Field ignored : classDef.getFields()) {
+            fieldCount++;
+        }
+        info.put("fieldCount", fieldCount);
+
+        return info;
+    }
+
+    /**
+     * 添加类
+     */
+    public void addClass(String sessionId, String smaliCode) throws Exception {
+        DexSession session = getSession(sessionId);
+        
+        // 将 Smali 代码编译为 ClassDef
+        ClassDef newClass = compileSmaliToClass(smaliCode, session.originalDexFile.getOpcodes());
+        session.modifiedClasses.add(newClass);
+        session.modified = true;
+        
+        Log.d(TAG, "Added class: " + newClass.getType());
+    }
+
+    /**
+     * 删除类
+     */
+    public void removeClass(String sessionId, String className) throws Exception {
+        DexSession session = getSession(sessionId);
+        session.removedClasses.add(className);
+        session.modified = true;
+        
+        Log.d(TAG, "Removed class: " + className);
+    }
+
+    /**
+     * 重命名类
+     */
+    public void renameClass(String sessionId, String oldName, String newName) throws Exception {
+        DexSession session = getSession(sessionId);
+        ClassDef originalClass = findClass(session, oldName);
+
+        if (originalClass == null) {
+            throw new IllegalArgumentException("Class not found: " + oldName);
+        }
+
+        // 创建重命名后的类
+        ImmutableClassDef renamedClass = new ImmutableClassDef(
+            newName,
+            originalClass.getAccessFlags(),
+            originalClass.getSuperclass(),
+            originalClass.getInterfaces(),
+            originalClass.getSourceFile(),
+            originalClass.getAnnotations(),
+            originalClass.getFields(),
+            originalClass.getMethods()
+        );
+
+        session.removedClasses.add(oldName);
+        session.modifiedClasses.add(renamedClass);
+        session.modified = true;
+        
+        Log.d(TAG, "Renamed class: " + oldName + " -> " + newName);
+    }
+
+    // ==================== 方法操作 ====================
+
+    /**
+     * 获取类的所有方法
+     */
+    public JSArray getMethods(String sessionId, String className) throws Exception {
+        DexSession session = getSession(sessionId);
+        ClassDef classDef = findClass(session, className);
+
+        if (classDef == null) {
+            throw new IllegalArgumentException("Class not found: " + className);
+        }
+
+        JSArray methods = new JSArray();
+        for (Method method : classDef.getMethods()) {
+            JSObject methodInfo = new JSObject();
+            methodInfo.put("name", method.getName());
+            methodInfo.put("returnType", method.getReturnType());
+            methodInfo.put("accessFlags", method.getAccessFlags());
+            
+            // 参数类型
+            JSArray params = new JSArray();
+            for (CharSequence param : method.getParameterTypes()) {
+                params.put(param.toString());
+            }
+            methodInfo.put("parameters", params);
+            
+            // 方法签名
+            StringBuilder sig = new StringBuilder("(");
+            for (CharSequence param : method.getParameterTypes()) {
+                sig.append(param);
+            }
+            sig.append(")").append(method.getReturnType());
+            methodInfo.put("signature", sig.toString());
+            
+            methods.put(methodInfo);
+        }
+
+        return methods;
+    }
+
+    /**
+     * 获取方法详细信息
+     */
+    public JSObject getMethodInfo(String sessionId, String className, 
+                                   String methodName, String methodSignature) throws Exception {
+        DexSession session = getSession(sessionId);
+        Method method = findMethod(session, className, methodName, methodSignature);
+
+        if (method == null) {
+            throw new IllegalArgumentException("Method not found: " + methodName);
+        }
+
+        JSObject info = new JSObject();
+        info.put("name", method.getName());
+        info.put("returnType", method.getReturnType());
+        info.put("accessFlags", method.getAccessFlags());
+        info.put("definingClass", method.getDefiningClass());
+
+        // 参数
+        JSArray params = new JSArray();
+        for (CharSequence param : method.getParameterTypes()) {
+            params.put(param.toString());
+        }
+        info.put("parameters", params);
+
+        // 实现信息
+        MethodImplementation impl = method.getImplementation();
+        if (impl != null) {
+            info.put("registerCount", impl.getRegisterCount());
+            int instructionCount = 0;
+            for (Instruction ignored : impl.getInstructions()) {
+                instructionCount++;
+            }
+            info.put("instructionCount", instructionCount);
+        }
+
+        return info;
+    }
+
+    /**
+     * 获取方法的 Smali 代码
+     */
+    public JSObject getMethodSmali(String sessionId, String className,
+                                    String methodName, String methodSignature) throws Exception {
+        DexSession session = getSession(sessionId);
+        
+        // 获取类的完整 Smali，然后提取方法部分
+        String classSmali = classToSmali(sessionId, className).getString("smali");
+        
+        // 简化处理：返回整个类的 Smali（实际应该解析提取特定方法）
+        JSObject result = new JSObject();
+        result.put("className", className);
+        result.put("methodName", methodName);
+        result.put("methodSignature", methodSignature);
+        result.put("smali", extractMethodSmali(classSmali, methodName, methodSignature));
+        return result;
+    }
+
+    /**
+     * 设置方法的 Smali 代码
+     */
+    public void setMethodSmali(String sessionId, String className,
+                               String methodName, String methodSignature,
+                               String smaliCode) throws Exception {
+        DexSession session = getSession(sessionId);
+        ClassDef classDef = findClass(session, className);
+
+        if (classDef == null) {
+            throw new IllegalArgumentException("Class not found: " + className);
+        }
+
+        // 获取原类的 Smali
+        String classSmali = classToSmali(sessionId, className).getString("smali");
+        
+        // 替换方法
+        String modifiedSmali = replaceMethodInSmali(classSmali, methodName, methodSignature, smaliCode);
+        
+        // 重新编译
+        ClassDef modifiedClass = compileSmaliToClass(modifiedSmali, session.originalDexFile.getOpcodes());
+        
+        // 更新会话
+        session.removedClasses.add(className);
+        session.modifiedClasses.add(modifiedClass);
+        session.modified = true;
+        
+        Log.d(TAG, "Modified method: " + className + "->" + methodName);
+    }
+
+    /**
+     * 添加方法
+     */
+    public void addMethod(String sessionId, String className, String smaliCode) throws Exception {
+        DexSession session = getSession(sessionId);
+        ClassDef classDef = findClass(session, className);
+
+        if (classDef == null) {
+            throw new IllegalArgumentException("Class not found: " + className);
+        }
+
+        // 获取原类 Smali 并添加新方法
+        String classSmali = classToSmali(sessionId, className).getString("smali");
+        String modifiedSmali = insertMethodToSmali(classSmali, smaliCode);
+        
+        // 重新编译
+        ClassDef modifiedClass = compileSmaliToClass(modifiedSmali, session.originalDexFile.getOpcodes());
+        
+        session.removedClasses.add(className);
+        session.modifiedClasses.add(modifiedClass);
+        session.modified = true;
+    }
+
+    /**
+     * 删除方法
+     */
+    public void removeMethod(String sessionId, String className,
+                             String methodName, String methodSignature) throws Exception {
+        DexSession session = getSession(sessionId);
+        ClassDef classDef = findClass(session, className);
+
+        if (classDef == null) {
+            throw new IllegalArgumentException("Class not found: " + className);
+        }
+
+        // 获取原类 Smali 并删除方法
+        String classSmali = classToSmali(sessionId, className).getString("smali");
+        String modifiedSmali = removeMethodFromSmali(classSmali, methodName, methodSignature);
+        
+        // 重新编译
+        ClassDef modifiedClass = compileSmaliToClass(modifiedSmali, session.originalDexFile.getOpcodes());
+        
+        session.removedClasses.add(className);
+        session.modifiedClasses.add(modifiedClass);
+        session.modified = true;
+    }
+
+    // ==================== 字段操作 ====================
+
+    /**
+     * 获取类的所有字段
+     */
+    public JSArray getFields(String sessionId, String className) throws Exception {
+        DexSession session = getSession(sessionId);
+        ClassDef classDef = findClass(session, className);
+
+        if (classDef == null) {
+            throw new IllegalArgumentException("Class not found: " + className);
+        }
+
+        JSArray fields = new JSArray();
+        for (Field field : classDef.getFields()) {
+            JSObject fieldInfo = new JSObject();
+            fieldInfo.put("name", field.getName());
+            fieldInfo.put("type", field.getType());
+            fieldInfo.put("accessFlags", field.getAccessFlags());
+            fields.put(fieldInfo);
+        }
+
+        return fields;
+    }
+
+    /**
+     * 获取字段详细信息
+     */
+    public JSObject getFieldInfo(String sessionId, String className, String fieldName) throws Exception {
+        DexSession session = getSession(sessionId);
+        ClassDef classDef = findClass(session, className);
+
+        if (classDef == null) {
+            throw new IllegalArgumentException("Class not found: " + className);
+        }
+
+        for (Field field : classDef.getFields()) {
+            if (field.getName().equals(fieldName)) {
+                JSObject info = new JSObject();
+                info.put("name", field.getName());
+                info.put("type", field.getType());
+                info.put("accessFlags", field.getAccessFlags());
+                info.put("definingClass", field.getDefiningClass());
+                return info;
+            }
+        }
+
+        throw new IllegalArgumentException("Field not found: " + fieldName);
+    }
+
+    /**
+     * 添加字段
+     */
+    public void addField(String sessionId, String className, String fieldDef) throws Exception {
+        DexSession session = getSession(sessionId);
+        ClassDef classDef = findClass(session, className);
+
+        if (classDef == null) {
+            throw new IllegalArgumentException("Class not found: " + className);
+        }
+
+        // 获取原类 Smali 并添加字段定义
+        String classSmali = classToSmali(sessionId, className).getString("smali");
+        String modifiedSmali = insertFieldToSmali(classSmali, fieldDef);
+        
+        // 重新编译
+        ClassDef modifiedClass = compileSmaliToClass(modifiedSmali, session.originalDexFile.getOpcodes());
+        
+        session.removedClasses.add(className);
+        session.modifiedClasses.add(modifiedClass);
+        session.modified = true;
+    }
+
+    /**
+     * 删除字段
+     */
+    public void removeField(String sessionId, String className, String fieldName) throws Exception {
+        DexSession session = getSession(sessionId);
+        ClassDef classDef = findClass(session, className);
+
+        if (classDef == null) {
+            throw new IllegalArgumentException("Class not found: " + className);
+        }
+
+        // 获取原类 Smali 并删除字段
+        String classSmali = classToSmali(sessionId, className).getString("smali");
+        String modifiedSmali = removeFieldFromSmali(classSmali, fieldName);
+        
+        // 重新编译
+        ClassDef modifiedClass = compileSmaliToClass(modifiedSmali, session.originalDexFile.getOpcodes());
+        
+        session.removedClasses.add(className);
+        session.modifiedClasses.add(modifiedClass);
+        session.modified = true;
+    }
+
+    // ==================== Smali 操作 ====================
+
+    /**
+     * 将类转换为 Smali 代码
+     */
+    public JSObject classToSmali(String sessionId, String className) throws Exception {
+        DexSession session = getSession(sessionId);
+        ClassDef classDef = findClass(session, className);
+
+        if (classDef == null) {
+            throw new IllegalArgumentException("Class not found: " + className);
+        }
+
+        // 使用 baksmali 转换
+        StringWriter writer = new StringWriter();
+        BaksmaliOptions options = new BaksmaliOptions();
+        
+        // 创建临时 DEX 只包含该类
+        List<ClassDef> singleClass = new ArrayList<>();
+        singleClass.add(classDef);
+        ImmutableDexFile singleDex = new ImmutableDexFile(
+            session.originalDexFile.getOpcodes(), 
+            singleClass
+        );
+
+        // 使用临时目录输出
+        File tempDir = File.createTempFile("smali_", "_temp");
+        tempDir.delete();
+        tempDir.mkdirs();
+
+        try {
+            Baksmali.disassembleDexFile(singleDex, tempDir, 1, options);
+            
+            // 读取生成的 smali 文件
+            String smaliPath = className.substring(1, className.length() - 1) + ".smali";
+            File smaliFile = new File(tempDir, smaliPath);
+            
+            if (smaliFile.exists()) {
+                String smali = readFileContent(smaliFile);
+                JSObject result = new JSObject();
+                result.put("className", className);
+                result.put("smali", smali);
+                return result;
+            } else {
+                throw new IOException("Failed to generate smali for: " + className);
+            }
+        } finally {
+            deleteRecursive(tempDir);
+        }
+    }
+
+    /**
+     * 将 Smali 代码编译为类并添加到 DEX
+     */
+    public void smaliToClass(String sessionId, String smaliCode) throws Exception {
+        DexSession session = getSession(sessionId);
+        ClassDef newClass = compileSmaliToClass(smaliCode, session.originalDexFile.getOpcodes());
+        session.modifiedClasses.add(newClass);
+        session.modified = true;
+    }
+
+    /**
+     * 反汇编整个 DEX 到目录
+     */
+    public void disassemble(String sessionId, String outputDir) throws Exception {
+        DexSession session = getSession(sessionId);
+        File outDir = new File(outputDir);
+        outDir.mkdirs();
+
+        BaksmaliOptions options = new BaksmaliOptions();
+        Baksmali.disassembleDexFile(session.originalDexFile, outDir, 4, options);
+        
+        Log.d(TAG, "Disassembled to: " + outputDir);
+    }
+
+    /**
+     * 汇编 Smali 目录为 DEX
+     */
+    public JSObject assemble(String smaliDir, String outputPath) throws Exception {
+        File inputDir = new File(smaliDir);
+        File outputFile = new File(outputPath);
+
+        if (!inputDir.exists() || !inputDir.isDirectory()) {
+            throw new IllegalArgumentException("Invalid smali directory: " + smaliDir);
+        }
+
+        outputFile.getParentFile().mkdirs();
+
+        SmaliOptions options = new SmaliOptions();
+        options.outputDexFile = outputPath;
+        
+        List<File> smaliFiles = collectSmaliFiles(inputDir);
+        List<String> filePaths = new ArrayList<>();
+        for (File f : smaliFiles) {
+            filePaths.add(f.getAbsolutePath());
+        }
+
+        boolean success = Smali.assemble(options, filePaths);
+
+        JSObject result = new JSObject();
+        result.put("success", success);
+        result.put("outputPath", outputPath);
+        return result;
+    }
+
+    // ==================== 搜索操作 ====================
+
+    /**
+     * 搜索字符串
+     */
+    public JSArray searchString(String sessionId, String query, 
+                                boolean regex, boolean caseSensitive) throws Exception {
+        DexSession session = getSession(sessionId);
+        JSArray results = new JSArray();
+
+        Pattern pattern = null;
+        if (regex) {
+            int flags = caseSensitive ? 0 : Pattern.CASE_INSENSITIVE;
+            pattern = Pattern.compile(query, flags);
+        }
+
+        // 遍历所有类中的字符串引用进行搜索
+        Set<String> searchedStrings = new HashSet<>();
+        for (ClassDef classDef : session.originalDexFile.getClasses()) {
+            // 类名
+            checkAndAddString(classDef.getType(), query, regex, caseSensitive, pattern, searchedStrings, results);
+            // 父类
+            if (classDef.getSuperclass() != null) {
+                checkAndAddString(classDef.getSuperclass(), query, regex, caseSensitive, pattern, searchedStrings, results);
+            }
+        }
+
+        return results;
+    }
+
+    /**
+     * 搜索代码
+     */
+    public JSArray searchCode(String sessionId, String query, boolean regex) throws Exception {
+        DexSession session = getSession(sessionId);
+        JSArray results = new JSArray();
+
+        Pattern pattern = regex ? Pattern.compile(query) : null;
+
+        for (ClassDef classDef : session.originalDexFile.getClasses()) {
+            if (session.removedClasses.contains(classDef.getType())) continue;
+
+            try {
+                String smali = classToSmali(sessionId, classDef.getType()).getString("smali");
+                boolean match = regex ? pattern.matcher(smali).find() : smali.contains(query);
+                
+                if (match) {
+                    JSObject item = new JSObject();
+                    item.put("className", classDef.getType());
+                    item.put("matchCount", countMatches(smali, query, regex));
+                    results.put(item);
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "Failed to search class: " + classDef.getType(), e);
+            }
+        }
+
+        return results;
+    }
+
+    /**
+     * 搜索方法
+     */
+    public JSArray searchMethod(String sessionId, String query) throws Exception {
+        DexSession session = getSession(sessionId);
+        JSArray results = new JSArray();
+        String queryLower = query.toLowerCase();
+
+        for (ClassDef classDef : session.originalDexFile.getClasses()) {
+            if (session.removedClasses.contains(classDef.getType())) continue;
+
+            for (Method method : classDef.getMethods()) {
+                if (method.getName().toLowerCase().contains(queryLower)) {
+                    JSObject item = new JSObject();
+                    item.put("className", classDef.getType());
+                    item.put("methodName", method.getName());
+                    item.put("returnType", method.getReturnType());
+                    results.put(item);
+                }
+            }
+        }
+
+        return results;
+    }
+
+    /**
+     * 搜索字段
+     */
+    public JSArray searchField(String sessionId, String query) throws Exception {
+        DexSession session = getSession(sessionId);
+        JSArray results = new JSArray();
+        String queryLower = query.toLowerCase();
+
+        for (ClassDef classDef : session.originalDexFile.getClasses()) {
+            if (session.removedClasses.contains(classDef.getType())) continue;
+
+            for (Field field : classDef.getFields()) {
+                if (field.getName().toLowerCase().contains(queryLower)) {
+                    JSObject item = new JSObject();
+                    item.put("className", classDef.getType());
+                    item.put("fieldName", field.getName());
+                    item.put("fieldType", field.getType());
+                    results.put(item);
+                }
+            }
+        }
+
+        return results;
+    }
+
+    // ==================== 工具操作 ====================
+
+    /**
+     * 修复 DEX 文件
+     */
+    public void fixDex(String inputPath, String outputPath) throws Exception {
+        // 读取并重新写入 DEX 来修复格式问题
+        File inputFile = new File(inputPath);
+        DexBackedDexFile dexFile = (DexBackedDexFile) DexFileFactory.loadDexFile(
+            inputFile,
+            Opcodes.getDefault()
+        );
+
+        DexPool dexPool = new DexPool(dexFile.getOpcodes());
+        for (ClassDef classDef : dexFile.getClasses()) {
+            dexPool.internClass(classDef);
+        }
+
+        File outputFile = new File(outputPath);
+        outputFile.getParentFile().mkdirs();
+        dexPool.writeTo(new FileDataStore(outputFile));
+        
+        Log.d(TAG, "Fixed DEX: " + inputPath + " -> " + outputPath);
+    }
+
+    /**
+     * 合并多个 DEX 文件
+     */
+    public void mergeDex(JSONArray inputPaths, String outputPath) throws Exception {
+        DexPool dexPool = new DexPool(Opcodes.getDefault());
+
+        for (int i = 0; i < inputPaths.length(); i++) {
+            String path = inputPaths.getString(i);
+            DexBackedDexFile dexFile = (DexBackedDexFile) DexFileFactory.loadDexFile(
+                new File(path),
+                Opcodes.getDefault()
+            );
+
+            for (ClassDef classDef : dexFile.getClasses()) {
+                dexPool.internClass(classDef);
+            }
+        }
+
+        File outputFile = new File(outputPath);
+        outputFile.getParentFile().mkdirs();
+        dexPool.writeTo(new FileDataStore(outputFile));
+        
+        Log.d(TAG, "Merged " + inputPaths.length() + " DEX files to: " + outputPath);
+    }
+
+    /**
+     * 拆分 DEX 文件
+     */
+    public JSArray splitDex(String sessionId, int maxClasses) throws Exception {
+        DexSession session = getSession(sessionId);
+        JSArray outputFiles = new JSArray();
+
+        List<ClassDef> allClasses = new ArrayList<>();
+        for (ClassDef classDef : session.originalDexFile.getClasses()) {
+            if (!session.removedClasses.contains(classDef.getType())) {
+                allClasses.add(classDef);
+            }
+        }
+
+        int dexIndex = 0;
+        for (int i = 0; i < allClasses.size(); i += maxClasses) {
+            DexPool dexPool = new DexPool(session.originalDexFile.getOpcodes());
+            
+            int end = Math.min(i + maxClasses, allClasses.size());
+            for (int j = i; j < end; j++) {
+                dexPool.internClass(allClasses.get(j));
+            }
+
+            String outputPath = session.filePath.replace(".dex", "_" + dexIndex + ".dex");
+            dexPool.writeTo(new FileDataStore(new File(outputPath)));
+            outputFiles.put(outputPath);
+            dexIndex++;
+        }
+
+        return outputFiles;
+    }
+
+    /**
+     * 获取字符串常量池
+     */
+    public JSArray getStrings(String sessionId) throws Exception {
+        DexSession session = getSession(sessionId);
+        JSArray strings = new JSArray();
+
+        // 收集所有类中的字符串
+        Set<String> collectedStrings = new HashSet<>();
+        int index = 0;
+        for (ClassDef classDef : session.originalDexFile.getClasses()) {
+            if (!collectedStrings.contains(classDef.getType())) {
+                collectedStrings.add(classDef.getType());
+                JSObject item = new JSObject();
+                item.put("index", index++);
+                item.put("value", classDef.getType());
+                strings.put(item);
+            }
+        }
+
+        return strings;
+    }
+
+    /**
+     * 修改字符串
+     */
+    public void modifyString(String sessionId, String oldString, String newString) throws Exception {
+        DexSession session = getSession(sessionId);
+
+        // 需要遍历所有类，替换字符串引用
+        for (ClassDef classDef : session.originalDexFile.getClasses()) {
+            if (session.removedClasses.contains(classDef.getType())) continue;
+
+            try {
+                String smali = classToSmali(sessionId, classDef.getType()).getString("smali");
+                if (smali.contains(oldString)) {
+                    String modifiedSmali = smali.replace(oldString, newString);
+                    ClassDef modifiedClass = compileSmaliToClass(modifiedSmali, session.originalDexFile.getOpcodes());
+                    
+                    session.removedClasses.add(classDef.getType());
+                    session.modifiedClasses.add(modifiedClass);
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "Failed to modify string in class: " + classDef.getType(), e);
+            }
+        }
+
+        session.modified = true;
+    }
+
+    // ==================== 辅助方法 ====================
+
+    private DexSession getSession(String sessionId) throws Exception {
+        DexSession session = sessions.get(sessionId);
+        if (session == null) {
+            throw new IllegalArgumentException("Session not found: " + sessionId);
+        }
+        return session;
+    }
+
+    private void checkAndAddString(String str, String query, boolean regex, 
+                                     boolean caseSensitive, Pattern pattern,
+                                     Set<String> searchedStrings, JSArray results) {
+        if (str == null || searchedStrings.contains(str)) return;
+        searchedStrings.add(str);
+        
+        boolean match;
+        if (regex) {
+            match = pattern.matcher(str).find();
+        } else if (caseSensitive) {
+            match = str.contains(query);
+        } else {
+            match = str.toLowerCase().contains(query.toLowerCase());
+        }
+        
+        if (match) {
+            JSObject item = new JSObject();
+            item.put("index", searchedStrings.size() - 1);
+            item.put("value", str);
+            results.put(item);
+        }
+    }
+
+    private ClassDef findClass(DexSession session, String className) {
+        // 先检查修改后的类
+        for (ClassDef classDef : session.modifiedClasses) {
+            if (classDef.getType().equals(className)) {
+                return classDef;
+            }
+        }
+        
+        // 再检查原始类
+        if (!session.removedClasses.contains(className)) {
+            for (ClassDef classDef : session.originalDexFile.getClasses()) {
+                if (classDef.getType().equals(className)) {
+                    return classDef;
+                }
+            }
+        }
+        
+        return null;
+    }
+
+    private Method findMethod(DexSession session, String className, 
+                              String methodName, String methodSignature) {
+        ClassDef classDef = findClass(session, className);
+        if (classDef == null) return null;
+
+        for (Method method : classDef.getMethods()) {
+            if (method.getName().equals(methodName)) {
+                StringBuilder sig = new StringBuilder("(");
+                for (CharSequence param : method.getParameterTypes()) {
+                    sig.append(param);
+                }
+                sig.append(")").append(method.getReturnType());
+                
+                if (sig.toString().equals(methodSignature)) {
+                    return method;
+                }
+            }
+        }
+        
+        return null;
+    }
+
+    private ClassDef compileSmaliToClass(String smaliCode, Opcodes opcodes) throws Exception {
+        // 创建临时文件
+        File tempDir = File.createTempFile("smali_compile_", "_temp");
+        tempDir.delete();
+        tempDir.mkdirs();
+
+        try {
+            // 写入 smali 文件
+            File smaliFile = new File(tempDir, "temp.smali");
+            try (BufferedWriter writer = new BufferedWriter(new FileWriter(smaliFile))) {
+                writer.write(smaliCode);
+            }
+
+            // 编译
+            File outputDex = new File(tempDir, "output.dex");
+            SmaliOptions options = new SmaliOptions();
+            options.outputDexFile = outputDex.getAbsolutePath();
+            
+            List<String> files = new ArrayList<>();
+            files.add(smaliFile.getAbsolutePath());
+            
+            if (!Smali.assemble(options, files)) {
+                throw new Exception("Failed to compile smali code");
+            }
+
+            // 读取编译后的类
+            DexBackedDexFile compiledDex = DexBackedDexFile.fromInputStream(
+                opcodes,
+                new FileInputStream(outputDex)
+            );
+
+            for (ClassDef classDef : compiledDex.getClasses()) {
+                return classDef; // 返回第一个类
+            }
+
+            throw new Exception("No class found in compiled smali");
+        } finally {
+            deleteRecursive(tempDir);
+        }
+    }
+
+    private String extractMethodSmali(String classSmali, String methodName, String signature) {
+        // 简化实现：查找方法定义并提取
+        String methodStart = ".method";
+        String methodEnd = ".end method";
+        
+        int searchStart = 0;
+        while (true) {
+            int start = classSmali.indexOf(methodStart, searchStart);
+            if (start == -1) break;
+            
+            int end = classSmali.indexOf(methodEnd, start);
+            if (end == -1) break;
+            
+            String methodBlock = classSmali.substring(start, end + methodEnd.length());
+            if (methodBlock.contains(methodName)) {
+                return methodBlock;
+            }
+            
+            searchStart = end + methodEnd.length();
+        }
+        
+        return "";
+    }
+
+
+    private String insertMethodToSmali(String classSmali, String methodCode) {
+        // 在类结束前插入方法
+        int endClass = classSmali.lastIndexOf(".end class");
+        if (endClass != -1) {
+            return classSmali.substring(0, endClass) + "\n" + methodCode + "\n\n" + 
+                   classSmali.substring(endClass);
+        }
+        return classSmali + "\n" + methodCode;
+    }
+
+    private String removeMethodFromSmali(String classSmali, String methodName, String signature) {
+        String methodStart = ".method";
+        String methodEnd = ".end method";
+        
+        int searchStart = 0;
+        while (true) {
+            int start = classSmali.indexOf(methodStart, searchStart);
+            if (start == -1) break;
+            
+            int end = classSmali.indexOf(methodEnd, start);
+            if (end == -1) break;
+            
+            String methodBlock = classSmali.substring(start, end + methodEnd.length());
+            if (methodBlock.contains(methodName)) {
+                return classSmali.substring(0, start) + classSmali.substring(end + methodEnd.length());
+            }
+            
+            searchStart = end + methodEnd.length();
+        }
+        
+        return classSmali;
+    }
+
+    private String insertFieldToSmali(String classSmali, String fieldDef) {
+        // 在第一个方法前或类结束前插入字段
+        int methodPos = classSmali.indexOf(".method");
+        if (methodPos != -1) {
+            return classSmali.substring(0, methodPos) + fieldDef + "\n\n" + 
+                   classSmali.substring(methodPos);
+        }
+        
+        int endClass = classSmali.lastIndexOf(".end class");
+        if (endClass != -1) {
+            return classSmali.substring(0, endClass) + fieldDef + "\n\n" + 
+                   classSmali.substring(endClass);
+        }
+        
+        return classSmali + "\n" + fieldDef;
+    }
+
+    private String removeFieldFromSmali(String classSmali, String fieldName) {
+        // 简化实现：移除包含字段名的 .field 行
+        String[] lines = classSmali.split("\n");
+        StringBuilder result = new StringBuilder();
+        
+        for (String line : lines) {
+            if (!(line.trim().startsWith(".field") && line.contains(fieldName))) {
+                result.append(line).append("\n");
+            }
+        }
+        
+        return result.toString();
+    }
+
+    private List<File> collectSmaliFiles(File dir) {
+        List<File> files = new ArrayList<>();
+        File[] children = dir.listFiles();
+        if (children != null) {
+            for (File child : children) {
+                if (child.isDirectory()) {
+                    files.addAll(collectSmaliFiles(child));
+                } else if (child.getName().endsWith(".smali")) {
+                    files.add(child);
+                }
+            }
+        }
+        return files;
+    }
+
+    private String readFileContent(File file) throws IOException {
+        StringBuilder content = new StringBuilder();
+        try (java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.FileReader(file))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                content.append(line).append("\n");
+            }
+        }
+        return content.toString();
+    }
+
+    private void deleteRecursive(File file) {
+        if (file.isDirectory()) {
+            File[] children = file.listFiles();
+            if (children != null) {
+                for (File child : children) {
+                    deleteRecursive(child);
+                }
+            }
+        }
+        file.delete();
+    }
+
+    private int countMatches(String text, String query, boolean regex) {
+        int count = 0;
+        if (regex) {
+            java.util.regex.Matcher matcher = Pattern.compile(query).matcher(text);
+            while (matcher.find()) count++;
+        } else {
+            int index = 0;
+            while ((index = text.indexOf(query, index)) != -1) {
+                count++;
+                index += query.length();
+            }
+        }
+        return count;
+    }
+
+    // ==================== APK 内 DEX 操作（无需会话） ====================
+
+    /**
+     * 从 APK 中的 DEX 文件列出所有类
+     * @param apkPath APK 文件路径
+     * @param dexPath DEX 文件在 APK 中的路径（如 "classes.dex"）
+     */
+    public JSObject listDexClassesFromApk(String apkPath, String dexPath) throws Exception {
+        JSObject result = new JSObject();
+        JSArray classes = new JSArray();
+        
+        java.util.zip.ZipFile zipFile = null;
+        java.io.InputStream dexInputStream = null;
+        
+        try {
+            zipFile = new java.util.zip.ZipFile(apkPath);
+            java.util.zip.ZipEntry dexEntry = zipFile.getEntry(dexPath);
+            
+            if (dexEntry == null) {
+                throw new IOException("DEX file not found in APK: " + dexPath);
+            }
+            
+            dexInputStream = zipFile.getInputStream(dexEntry);
+            
+            // 读取 DEX 文件到内存
+            java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+            byte[] buffer = new byte[8192];
+            int len;
+            while ((len = dexInputStream.read(buffer)) != -1) {
+                baos.write(buffer, 0, len);
+            }
+            byte[] dexBytes = baos.toByteArray();
+            
+            // 解析 DEX 文件
+            DexBackedDexFile dexFile = new DexBackedDexFile(Opcodes.getDefault(), dexBytes);
+            
+            // 收集所有类名
+            for (ClassDef classDef : dexFile.getClasses()) {
+                String type = classDef.getType();
+                // 转换 Lcom/example/Class; 格式为 com.example.Class
+                String className = convertTypeToClassName(type);
+                classes.put(className);
+            }
+            
+            result.put("classes", classes);
+            result.put("count", classes.length());
+            
+        } finally {
+            if (dexInputStream != null) {
+                try { dexInputStream.close(); } catch (Exception ignored) {}
+            }
+            if (zipFile != null) {
+                try { zipFile.close(); } catch (Exception ignored) {}
+            }
+        }
+        
+        return result;
+    }
+
+    /**
+     * 从 APK 中的 DEX 文件获取字符串常量池
+     */
+    public JSObject getDexStringsFromApk(String apkPath, String dexPath) throws Exception {
+        JSObject result = new JSObject();
+        JSArray strings = new JSArray();
+        
+        java.util.zip.ZipFile zipFile = null;
+        java.io.InputStream dexInputStream = null;
+        
+        try {
+            zipFile = new java.util.zip.ZipFile(apkPath);
+            java.util.zip.ZipEntry dexEntry = zipFile.getEntry(dexPath);
+            
+            if (dexEntry == null) {
+                throw new IOException("DEX file not found in APK: " + dexPath);
+            }
+            
+            dexInputStream = zipFile.getInputStream(dexEntry);
+            
+            // 读取 DEX 文件到内存
+            java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+            byte[] buffer = new byte[8192];
+            int len;
+            while ((len = dexInputStream.read(buffer)) != -1) {
+                baos.write(buffer, 0, len);
+            }
+            byte[] dexBytes = baos.toByteArray();
+            
+            // 解析 DEX 文件
+            DexBackedDexFile dexFile = new DexBackedDexFile(Opcodes.getDefault(), dexBytes);
+            
+            // 从类和方法中提取所有字符串引用
+            Set<String> uniqueStrings = new HashSet<>();
+            int index = 0;
+            
+            for (ClassDef classDef : dexFile.getClasses()) {
+                // 添加类名
+                String className = classDef.getType();
+                if (className != null && !uniqueStrings.contains(className)) {
+                    uniqueStrings.add(className);
+                }
+                
+                // 从字段中提取
+                for (Field field : classDef.getFields()) {
+                    String fieldName = field.getName();
+                    String fieldType = field.getType();
+                    if (fieldName != null && !uniqueStrings.contains(fieldName)) {
+                        uniqueStrings.add(fieldName);
+                    }
+                    if (fieldType != null && !uniqueStrings.contains(fieldType)) {
+                        uniqueStrings.add(fieldType);
+                    }
+                }
+                
+                // 从方法中提取
+                for (Method method : classDef.getMethods()) {
+                    String methodName = method.getName();
+                    if (methodName != null && !uniqueStrings.contains(methodName)) {
+                        uniqueStrings.add(methodName);
+                    }
+                    
+                    // 从方法实现中提取字符串常量
+                    MethodImplementation impl = method.getImplementation();
+                    if (impl != null) {
+                        for (Instruction instruction : impl.getInstructions()) {
+                            // 检查是否是字符串引用指令
+                            if (instruction instanceof com.android.tools.smali.dexlib2.iface.instruction.ReferenceInstruction) {
+                                com.android.tools.smali.dexlib2.iface.instruction.ReferenceInstruction refInstr = 
+                                    (com.android.tools.smali.dexlib2.iface.instruction.ReferenceInstruction) instruction;
+                                com.android.tools.smali.dexlib2.iface.reference.Reference ref = refInstr.getReference();
+                                if (ref instanceof com.android.tools.smali.dexlib2.iface.reference.StringReference) {
+                                    String str = ((com.android.tools.smali.dexlib2.iface.reference.StringReference) ref).getString();
+                                    if (str != null && !uniqueStrings.contains(str)) {
+                                        uniqueStrings.add(str);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // 转换为数组
+            for (String str : uniqueStrings) {
+                JSObject item = new JSObject();
+                item.put("index", index++);
+                item.put("value", str);
+                strings.put(item);
+            }
+            
+            result.put("strings", strings);
+            result.put("count", strings.length());
+            
+        } finally {
+            if (dexInputStream != null) {
+                try { dexInputStream.close(); } catch (Exception ignored) {}
+            }
+            if (zipFile != null) {
+                try { zipFile.close(); } catch (Exception ignored) {}
+            }
+        }
+        
+        return result;
+    }
+
+    /**
+     * 在 APK 中的 DEX 文件中搜索
+     */
+    public JSObject searchInDexFromApk(String apkPath, String dexPath, String query) throws Exception {
+        JSObject result = new JSObject();
+        JSArray results = new JSArray();
+        
+        Log.d(TAG, "searchInDexFromApk: apkPath=" + apkPath + ", dexPath=" + dexPath + ", query=" + query);
+        
+        if (query == null || query.isEmpty()) {
+            result.put("results", results);
+            result.put("count", 0);
+            return result;
+        }
+        
+        String queryLower = query.toLowerCase();
+        
+        java.util.zip.ZipFile zipFile = null;
+        java.io.InputStream dexInputStream = null;
+        
+        try {
+            zipFile = new java.util.zip.ZipFile(apkPath);
+            
+            // 尝试多种可能的 dexPath 格式
+            java.util.zip.ZipEntry dexEntry = zipFile.getEntry(dexPath);
+            if (dexEntry == null && !dexPath.startsWith("/")) {
+                // 如果没有找到，尝试去掉开头的斜杠
+                dexEntry = zipFile.getEntry(dexPath.replaceFirst("^/+", ""));
+            }
+            if (dexEntry == null) {
+                // 如果还是没找到，尝试只用文件名
+                String fileName = dexPath;
+                if (dexPath.contains("/")) {
+                    fileName = dexPath.substring(dexPath.lastIndexOf("/") + 1);
+                }
+                dexEntry = zipFile.getEntry(fileName);
+            }
+            
+            if (dexEntry == null) {
+                Log.e(TAG, "DEX file not found in APK: " + dexPath);
+                throw new IOException("DEX file not found in APK: " + dexPath);
+            }
+            
+            Log.d(TAG, "Found DEX entry: " + dexEntry.getName());
+            
+            dexInputStream = zipFile.getInputStream(dexEntry);
+            
+            // 读取 DEX 文件到内存
+            java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+            byte[] buffer = new byte[8192];
+            int len;
+            while ((len = dexInputStream.read(buffer)) != -1) {
+                baos.write(buffer, 0, len);
+            }
+            byte[] dexBytes = baos.toByteArray();
+            
+            // 解析 DEX 文件
+            DexBackedDexFile dexFile = new DexBackedDexFile(Opcodes.getDefault(), dexBytes);
+            
+            // 搜索类名和方法名
+            for (ClassDef classDef : dexFile.getClasses()) {
+                String className = convertTypeToClassName(classDef.getType());
+                
+                // 搜索类名
+                if (className.toLowerCase().contains(queryLower)) {
+                    JSObject item = new JSObject();
+                    item.put("className", className);
+                    item.put("type", "class");
+                    item.put("content", className);
+                    results.put(item);
+                }
+                
+                // 搜索方法名
+                for (Method method : classDef.getMethods()) {
+                    String methodName = method.getName();
+                    if (methodName.toLowerCase().contains(queryLower)) {
+                        JSObject item = new JSObject();
+                        item.put("className", className);
+                        item.put("methodName", methodName);
+                        item.put("type", "method");
+                        item.put("content", methodName + " in " + className);
+                        results.put(item);
+                    }
+                    
+                    // 搜索方法内的字符串
+                    MethodImplementation impl = method.getImplementation();
+                    if (impl != null) {
+                        for (Instruction instruction : impl.getInstructions()) {
+                            String instrStr = instruction.toString();
+                            if (instrStr.toLowerCase().contains(queryLower)) {
+                                JSObject item = new JSObject();
+                                item.put("className", className);
+                                item.put("methodName", methodName);
+                                item.put("type", "instruction");
+                                item.put("content", instrStr);
+                                results.put(item);
+                                break; // 每个方法只记录一次
+                            }
+                        }
+                    }
+                }
+            }
+            
+            result.put("results", results);
+            result.put("count", results.length());
+            
+        } finally {
+            if (dexInputStream != null) {
+                try { dexInputStream.close(); } catch (Exception ignored) {}
+            }
+            if (zipFile != null) {
+                try { zipFile.close(); } catch (Exception ignored) {}
+            }
+        }
+        
+        return result;
+    }
+
+    // ==================== MCP 工作流支持方法 ====================
+
+    /**
+     * 列出 APK 中的所有 DEX 文件
+     */
+    public JSObject listDexFilesInApk(String apkPath) throws Exception {
+        JSObject result = new JSObject();
+        JSArray dexFiles = new JSArray();
+        
+        java.util.zip.ZipFile zipFile = null;
+        try {
+            zipFile = new java.util.zip.ZipFile(apkPath);
+            java.util.Enumeration<? extends java.util.zip.ZipEntry> entries = zipFile.entries();
+            
+            while (entries.hasMoreElements()) {
+                java.util.zip.ZipEntry entry = entries.nextElement();
+                String name = entry.getName();
+                if (name.endsWith(".dex") && !name.contains("/")) {
+                    JSObject dexInfo = new JSObject();
+                    dexInfo.put("name", name);
+                    dexInfo.put("size", entry.getSize());
+                    dexFiles.put(dexInfo);
+                }
+            }
+            
+            result.put("apkPath", apkPath);
+            result.put("dexFiles", dexFiles);
+            result.put("count", dexFiles.length());
+            
+        } finally {
+            if (zipFile != null) {
+                try { zipFile.close(); } catch (Exception ignored) {}
+            }
+        }
+        
+        return result;
+    }
+
+    /**
+     * 打开多个 DEX 文件创建会话（MCP 工作流）
+     */
+    public JSObject openMultipleDex(String apkPath, JSONArray dexFiles) throws Exception {
+        JSObject result = new JSObject();
+        String sessionId = UUID.randomUUID().toString();
+        
+        // 创建复合会话
+        MultiDexSession multiSession = new MultiDexSession(sessionId, apkPath);
+        
+        java.util.zip.ZipFile zipFile = null;
+        int totalClasses = 0;
+        
+        try {
+            zipFile = new java.util.zip.ZipFile(apkPath);
+            
+            for (int i = 0; i < dexFiles.length(); i++) {
+                String dexName = dexFiles.getString(i);
+                java.util.zip.ZipEntry dexEntry = zipFile.getEntry(dexName);
+                
+                if (dexEntry == null) {
+                    Log.w(TAG, "DEX not found: " + dexName);
+                    continue;
+                }
+                
+                // 读取 DEX 到内存
+                java.io.InputStream is = zipFile.getInputStream(dexEntry);
+                java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+                byte[] buffer = new byte[8192];
+                int len;
+                while ((len = is.read(buffer)) != -1) {
+                    baos.write(buffer, 0, len);
+                }
+                is.close();
+                
+                // 解析 DEX
+                DexBackedDexFile dexFile = new DexBackedDexFile(Opcodes.getDefault(), baos.toByteArray());
+                multiSession.addDex(dexName, dexFile);
+                totalClasses += dexFile.getClasses().size();
+                
+                Log.d(TAG, "Loaded DEX: " + dexName + " with " + dexFile.getClasses().size() + " classes");
+            }
+            
+        } finally {
+            if (zipFile != null) {
+                try { zipFile.close(); } catch (Exception ignored) {}
+            }
+        }
+        
+        multiDexSessions.put(sessionId, multiSession);
+        
+        result.put("sessionId", sessionId);
+        result.put("apkPath", apkPath);
+        result.put("dexCount", multiSession.dexFiles.size());
+        result.put("classCount", totalClasses);
+        
+        return result;
+    }
+
+    /**
+     * 列出所有打开的会话
+     */
+    public JSArray listAllSessions() {
+        JSArray result = new JSArray();
+        
+        // 单 DEX 会话
+        for (Map.Entry<String, DexSession> entry : sessions.entrySet()) {
+            JSObject session = new JSObject();
+            session.put("sessionId", entry.getKey());
+            session.put("type", "single");
+            session.put("filePath", entry.getValue().filePath);
+            session.put("modified", entry.getValue().modified);
+            result.put(session);
+        }
+        
+        // 多 DEX 会话
+        for (Map.Entry<String, MultiDexSession> entry : multiDexSessions.entrySet()) {
+            JSObject session = new JSObject();
+            session.put("sessionId", entry.getKey());
+            session.put("type", "multi");
+            session.put("apkPath", entry.getValue().apkPath);
+            session.put("dexCount", entry.getValue().dexFiles.size());
+            session.put("modified", entry.getValue().modified);
+            result.put(session);
+        }
+        
+        return result;
+    }
+
+    /**
+     * 关闭多 DEX 会话
+     */
+    public void closeMultiDexSession(String sessionId) {
+        multiDexSessions.remove(sessionId);
+        Log.d(TAG, "Closed multi-dex session: " + sessionId);
+    }
+
+    /**
+     * 获取多 DEX 会话中的类列表（支持分页和过滤）
+     */
+    public JSObject getClassesFromMultiSession(String sessionId, String packageFilter, int offset, int limit) throws Exception {
+        MultiDexSession session = multiDexSessions.get(sessionId);
+        if (session == null) {
+            throw new IllegalArgumentException("Session not found: " + sessionId);
+        }
+        
+        JSObject result = new JSObject();
+        JSArray classes = new JSArray();
+        List<String> allClasses = new ArrayList<>();
+        
+        // 收集所有类
+        for (Map.Entry<String, DexBackedDexFile> entry : session.dexFiles.entrySet()) {
+            String dexName = entry.getKey();
+            DexBackedDexFile dexFile = entry.getValue();
+            
+            for (ClassDef classDef : dexFile.getClasses()) {
+                String className = convertTypeToClassName(classDef.getType());
+                
+                // 包名过滤
+                if (packageFilter != null && !packageFilter.isEmpty()) {
+                    if (!className.startsWith(packageFilter)) {
+                        continue;
+                    }
+                }
+                
+                allClasses.add(className + "|" + dexName);
+            }
+        }
+        
+        // 排序
+        java.util.Collections.sort(allClasses);
+        
+        // 分页
+        int total = allClasses.size();
+        int end = Math.min(offset + limit, total);
+        
+        for (int i = offset; i < end; i++) {
+            String[] parts = allClasses.get(i).split("\\|");
+            JSObject classInfo = new JSObject();
+            classInfo.put("className", parts[0]);
+            classInfo.put("dexFile", parts[1]);
+            classes.put(classInfo);
+        }
+        
+        result.put("total", total);
+        result.put("offset", offset);
+        result.put("limit", limit);
+        result.put("classes", classes);
+        result.put("hasMore", end < total);
+        
+        return result;
+    }
+
+    /**
+     * 在多 DEX 会话中搜索
+     */
+    public JSObject searchInMultiSession(String sessionId, String query, String searchType, 
+                                          boolean caseSensitive, int maxResults) throws Exception {
+        MultiDexSession session = multiDexSessions.get(sessionId);
+        if (session == null) {
+            throw new IllegalArgumentException("Session not found: " + sessionId);
+        }
+        
+        JSObject result = new JSObject();
+        JSArray results = new JSArray();
+        String queryMatch = caseSensitive ? query : query.toLowerCase();
+        
+        outerLoop:
+        for (Map.Entry<String, DexBackedDexFile> entry : session.dexFiles.entrySet()) {
+            String dexName = entry.getKey();
+            DexBackedDexFile dexFile = entry.getValue();
+            
+            for (ClassDef classDef : dexFile.getClasses()) {
+                if (results.length() >= maxResults) break outerLoop;
+                
+                String className = convertTypeToClassName(classDef.getType());
+                String classNameMatch = caseSensitive ? className : className.toLowerCase();
+                
+                switch (searchType) {
+                    case "class":
+                        if (classNameMatch.contains(queryMatch)) {
+                            JSObject item = new JSObject();
+                            item.put("type", "class");
+                            item.put("className", className);
+                            item.put("dexFile", dexName);
+                            results.put(item);
+                        }
+                        break;
+                        
+                    case "package":
+                        if (classNameMatch.startsWith(queryMatch)) {
+                            JSObject item = new JSObject();
+                            item.put("type", "package");
+                            item.put("className", className);
+                            item.put("dexFile", dexName);
+                            results.put(item);
+                        }
+                        break;
+                        
+                    case "method":
+                        for (Method method : classDef.getMethods()) {
+                            if (results.length() >= maxResults) break outerLoop;
+                            String methodName = method.getName();
+                            String methodMatch = caseSensitive ? methodName : methodName.toLowerCase();
+                            if (methodMatch.contains(queryMatch)) {
+                                JSObject item = new JSObject();
+                                item.put("type", "method");
+                                item.put("className", className);
+                                item.put("methodName", methodName);
+                                item.put("dexFile", dexName);
+                                results.put(item);
+                            }
+                        }
+                        break;
+                        
+                    case "field":
+                        for (Field field : classDef.getFields()) {
+                            if (results.length() >= maxResults) break outerLoop;
+                            String fieldName = field.getName();
+                            String fieldMatch = caseSensitive ? fieldName : fieldName.toLowerCase();
+                            if (fieldMatch.contains(queryMatch)) {
+                                JSObject item = new JSObject();
+                                item.put("type", "field");
+                                item.put("className", className);
+                                item.put("fieldName", fieldName);
+                                item.put("dexFile", dexName);
+                                results.put(item);
+                            }
+                        }
+                        break;
+                        
+                    case "string":
+                    case "code":
+                        // 需要反编译 smali 搜索
+                        String smali = getSmaliForClass(dexFile, classDef);
+                        String smaliMatch = caseSensitive ? smali : smali.toLowerCase();
+                        if (smaliMatch.contains(queryMatch)) {
+                            JSObject item = new JSObject();
+                            item.put("type", searchType);
+                            item.put("className", className);
+                            item.put("dexFile", dexName);
+                            // 找到匹配的行
+                            String[] lines = smali.split("\n");
+                            for (int i = 0; i < lines.length; i++) {
+                                String lineMatch = caseSensitive ? lines[i] : lines[i].toLowerCase();
+                                if (lineMatch.contains(queryMatch)) {
+                                    item.put("line", i + 1);
+                                    item.put("content", lines[i].trim());
+                                    break;
+                                }
+                            }
+                            results.put(item);
+                        }
+                        break;
+                        
+                    case "int":
+                        // 搜索整数常量
+                        String smaliForInt = getSmaliForClass(dexFile, classDef);
+                        if (smaliForInt.contains("0x" + query) || smaliForInt.contains(" " + query + "\n") || 
+                            smaliForInt.contains(" " + query + " ")) {
+                            JSObject item = new JSObject();
+                            item.put("type", "int");
+                            item.put("className", className);
+                            item.put("dexFile", dexName);
+                            results.put(item);
+                        }
+                        break;
+                }
+            }
+        }
+        
+        result.put("query", query);
+        result.put("searchType", searchType);
+        result.put("total", results.length());
+        result.put("results", results);
+        
+        return result;
+    }
+
+    /**
+     * 获取类的 Smali 代码（内部方法）
+     */
+    private String getSmaliForClass(DexBackedDexFile dexFile, ClassDef classDef) {
+        try {
+            BaksmaliOptions options = new BaksmaliOptions();
+            ClassDefinition classDefinition = new ClassDefinition(options, classDef);
+            java.io.StringWriter stringWriter = new java.io.StringWriter();
+            BaksmaliWriter writer = new BaksmaliWriter(stringWriter, null);
+            classDefinition.writeTo(writer);
+            writer.close();
+            return stringWriter.toString();
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    /**
+     * 从多 DEX 会话获取类的 Smali 代码
+     */
+    public JSObject getClassSmaliFromSession(String sessionId, String className) throws Exception {
+        MultiDexSession session = multiDexSessions.get(sessionId);
+        if (session == null) {
+            throw new IllegalArgumentException("Session not found: " + sessionId);
+        }
+        
+        String targetType = convertClassNameToType(className);
+        
+        for (Map.Entry<String, DexBackedDexFile> entry : session.dexFiles.entrySet()) {
+            String dexName = entry.getKey();
+            DexBackedDexFile dexFile = entry.getValue();
+            
+            for (ClassDef classDef : dexFile.getClasses()) {
+                if (classDef.getType().equals(targetType)) {
+                    JSObject result = new JSObject();
+                    result.put("className", className);
+                    result.put("dexFile", dexName);
+                    result.put("smaliContent", getSmaliForClass(dexFile, classDef));
+                    return result;
+                }
+            }
+        }
+        
+        throw new IllegalArgumentException("Class not found: " + className);
+    }
+
+    /**
+     * 修改类并保存到多 DEX 会话
+     */
+    public void modifyClassInSession(String sessionId, String className, String smaliContent) throws Exception {
+        MultiDexSession session = multiDexSessions.get(sessionId);
+        if (session == null) {
+            throw new IllegalArgumentException("Session not found: " + sessionId);
+        }
+        
+        String targetType = convertClassNameToType(className);
+        
+        // 找到类所在的 DEX
+        String targetDex = null;
+        for (Map.Entry<String, DexBackedDexFile> entry : session.dexFiles.entrySet()) {
+            for (ClassDef classDef : entry.getValue().getClasses()) {
+                if (classDef.getType().equals(targetType)) {
+                    targetDex = entry.getKey();
+                    break;
+                }
+            }
+            if (targetDex != null) break;
+        }
+        
+        if (targetDex == null) {
+            throw new IllegalArgumentException("Class not found: " + className);
+        }
+        
+        // 编译新的 Smali
+        ClassDef newClassDef = compileSmaliToClass(smaliContent, Opcodes.getDefault());
+        
+        // 记录修改
+        session.modifiedClasses.put(targetDex + "|" + className, newClassDef);
+        session.modified = true;
+        
+        Log.d(TAG, "Modified class in session: " + className);
+    }
+
+    /**
+     * 添加新类到会话
+     */
+    public void addClassToSession(String sessionId, String className, String smaliContent) throws Exception {
+        MultiDexSession session = multiDexSessions.get(sessionId);
+        if (session == null) {
+            throw new IllegalArgumentException("Session not found: " + sessionId);
+        }
+        
+        // 编译 Smali
+        ClassDef newClassDef = compileSmaliToClass(smaliContent, Opcodes.getDefault());
+        
+        // 添加到第一个 DEX（默认 classes.dex）
+        String targetDex = "classes.dex";
+        if (!session.dexFiles.containsKey(targetDex) && !session.dexFiles.isEmpty()) {
+            targetDex = session.dexFiles.keySet().iterator().next();
+        }
+        
+        session.modifiedClasses.put(targetDex + "|" + className, newClassDef);
+        session.modified = true;
+        
+        Log.d(TAG, "Added class to session: " + className);
+    }
+
+    /**
+     * 从会话中删除类
+     */
+    public void deleteClassFromSession(String sessionId, String className) throws Exception {
+        MultiDexSession session = multiDexSessions.get(sessionId);
+        if (session == null) {
+            throw new IllegalArgumentException("Session not found: " + sessionId);
+        }
+        
+        String targetType = convertClassNameToType(className);
+        
+        // 找到类所在的 DEX 并标记为删除
+        String targetDex = null;
+        for (Map.Entry<String, DexBackedDexFile> entry : session.dexFiles.entrySet()) {
+            for (ClassDef classDef : entry.getValue().getClasses()) {
+                if (classDef.getType().equals(targetType)) {
+                    targetDex = entry.getKey();
+                    break;
+                }
+            }
+            if (targetDex != null) break;
+        }
+        
+        if (targetDex == null) {
+            throw new IllegalArgumentException("Class not found: " + className);
+        }
+        
+        // 用 null 标记删除
+        session.modifiedClasses.put(targetDex + "|" + className, null);
+        session.modified = true;
+        
+        Log.d(TAG, "Deleted class from session: " + className);
+    }
+
+    /**
+     * 从会话中获取单个方法的 Smali 代码
+     */
+    public JSObject getMethodFromSession(String sessionId, String className, String methodName, String methodSignature) throws Exception {
+        JSObject result = new JSObject();
+        
+        MultiDexSession session = multiDexSessions.get(sessionId);
+        if (session == null) {
+            throw new IllegalArgumentException("Session not found: " + sessionId);
+        }
+        
+        // 先获取整个类的 Smali
+        JSObject classResult = getClassSmaliFromSession(sessionId, className);
+        String smaliContent = classResult.optString("smaliContent", "");
+        
+        if (smaliContent.isEmpty()) {
+            result.put("methodCode", "# 类未找到: " + className);
+            return result;
+        }
+        
+        // 解析并提取方法
+        String methodCode = extractMethodFromSmali(smaliContent, methodName, methodSignature);
+        result.put("methodCode", methodCode);
+        result.put("className", className);
+        result.put("methodName", methodName);
+        
+        return result;
+    }
+
+    /**
+     * 修改会话中的单个方法
+     */
+    public void modifyMethodInSession(String sessionId, String className, String methodName, String methodSignature, String newMethodCode) throws Exception {
+        MultiDexSession session = multiDexSessions.get(sessionId);
+        if (session == null) {
+            throw new IllegalArgumentException("Session not found: " + sessionId);
+        }
+        
+        // 获取整个类的 Smali
+        JSObject classResult = getClassSmaliFromSession(sessionId, className);
+        String smaliContent = classResult.optString("smaliContent", "");
+        
+        if (smaliContent.isEmpty()) {
+            throw new IllegalArgumentException("Class not found: " + className);
+        }
+        
+        // 替换方法
+        String newSmaliContent = replaceMethodInSmali(smaliContent, methodName, methodSignature, newMethodCode);
+        
+        // 保存修改后的类
+        modifyClassInSession(sessionId, className, newSmaliContent);
+        
+        Log.d(TAG, "Modified method in session: " + className + "." + methodName);
+    }
+
+    /**
+     * 从 Smali 代码中提取指定方法
+     */
+    private String extractMethodFromSmali(String smaliContent, String methodName, String methodSignature) {
+        String[] lines = smaliContent.split("\n");
+        StringBuilder methodCode = new StringBuilder();
+        boolean inMethod = false;
+        boolean found = false;
+        
+        for (String line : lines) {
+            if (line.startsWith(".method ")) {
+                // 检查是否是目标方法
+                if (line.contains(" " + methodName + "(") || line.contains(" " + methodName + ";")) {
+                    // 如果指定了签名，进一步匹配
+                    if (methodSignature == null || methodSignature.isEmpty() || line.contains(methodSignature)) {
+                        inMethod = true;
+                        found = true;
+                    }
+                }
+            }
+            
+            if (inMethod) {
+                methodCode.append(line).append("\n");
+                if (line.equals(".end method")) {
+                    break;
+                }
+            }
+        }
+        
+        if (!found) {
+            return "# 方法未找到: " + methodName + (methodSignature != null ? methodSignature : "");
+        }
+        
+        return methodCode.toString();
+    }
+
+    /**
+     * 替换 Smali 代码中的指定方法
+     */
+    private String replaceMethodInSmali(String smaliContent, String methodName, String methodSignature, String newMethodCode) {
+        String[] lines = smaliContent.split("\n");
+        StringBuilder result = new StringBuilder();
+        boolean inMethod = false;
+        boolean replaced = false;
+        
+        for (String line : lines) {
+            if (line.startsWith(".method ")) {
+                if (line.contains(" " + methodName + "(") || line.contains(" " + methodName + ";")) {
+                    if (methodSignature == null || methodSignature.isEmpty() || line.contains(methodSignature)) {
+                        // 插入新方法代码
+                        result.append(newMethodCode.trim()).append("\n");
+                        inMethod = true;
+                        replaced = true;
+                        continue;
+                    }
+                }
+            }
+            
+            if (inMethod) {
+                if (line.equals(".end method")) {
+                    inMethod = false;
+                }
+                continue;
+            }
+            
+            result.append(line).append("\n");
+        }
+        
+        if (!replaced) {
+            throw new IllegalArgumentException("Method not found: " + methodName);
+        }
+        
+        return result.toString();
+    }
+
+    /**
+     * 列出会话中类的所有方法
+     */
+    public JSObject listMethodsFromSession(String sessionId, String className) throws Exception {
+        MultiDexSession session = multiDexSessions.get(sessionId);
+        if (session == null) {
+            throw new IllegalArgumentException("Session not found: " + sessionId);
+        }
+        
+        String targetType = convertClassNameToType(className);
+        JSObject result = new JSObject();
+        JSArray methods = new JSArray();
+        
+        for (DexBackedDexFile dexFile : session.dexFiles.values()) {
+            for (ClassDef classDef : dexFile.getClasses()) {
+                if (classDef.getType().equals(targetType)) {
+                    for (com.android.tools.smali.dexlib2.iface.Method method : classDef.getMethods()) {
+                        JSObject methodInfo = new JSObject();
+                        methodInfo.put("name", method.getName());
+                        methodInfo.put("returnType", method.getReturnType());
+                        methodInfo.put("accessFlags", method.getAccessFlags());
+                        
+                        // 参数类型
+                        StringBuilder params = new StringBuilder("(");
+                        for (CharSequence param : method.getParameterTypes()) {
+                            params.append(param);
+                        }
+                        params.append(")").append(method.getReturnType());
+                        methodInfo.put("signature", params.toString());
+                        
+                        methods.put(methodInfo);
+                    }
+                    break;
+                }
+            }
+        }
+        
+        result.put("className", className);
+        result.put("methods", methods);
+        result.put("count", methods.length());
+        return result;
+    }
+
+    /**
+     * 列出会话中类的所有字段
+     */
+    public JSObject listFieldsFromSession(String sessionId, String className) throws Exception {
+        MultiDexSession session = multiDexSessions.get(sessionId);
+        if (session == null) {
+            throw new IllegalArgumentException("Session not found: " + sessionId);
+        }
+        
+        String targetType = convertClassNameToType(className);
+        JSObject result = new JSObject();
+        JSArray fields = new JSArray();
+        
+        for (DexBackedDexFile dexFile : session.dexFiles.values()) {
+            for (ClassDef classDef : dexFile.getClasses()) {
+                if (classDef.getType().equals(targetType)) {
+                    for (com.android.tools.smali.dexlib2.iface.Field field : classDef.getFields()) {
+                        JSObject fieldInfo = new JSObject();
+                        fieldInfo.put("name", field.getName());
+                        fieldInfo.put("type", field.getType());
+                        fieldInfo.put("accessFlags", field.getAccessFlags());
+                        fields.put(fieldInfo);
+                    }
+                    break;
+                }
+            }
+        }
+        
+        result.put("className", className);
+        result.put("fields", fields);
+        result.put("count", fields.length());
+        return result;
+    }
+
+    /**
+     * 重命名会话中的类
+     */
+    public void renameClassInSession(String sessionId, String oldClassName, String newClassName) throws Exception {
+        MultiDexSession session = multiDexSessions.get(sessionId);
+        if (session == null) {
+            throw new IllegalArgumentException("Session not found: " + sessionId);
+        }
+        
+        // 获取原类的 Smali
+        JSObject classResult = getClassSmaliFromSession(sessionId, oldClassName);
+        String smaliContent = classResult.optString("smaliContent", "");
+        
+        if (smaliContent.isEmpty()) {
+            throw new IllegalArgumentException("Class not found: " + oldClassName);
+        }
+        
+        String oldType = convertClassNameToType(oldClassName);
+        String newType = convertClassNameToType(newClassName);
+        
+        // 替换类名
+        String newSmaliContent = smaliContent.replace(oldType, newType);
+        
+        // 删除旧类，添加新类
+        deleteClassFromSession(sessionId, oldClassName);
+        addClassToSession(sessionId, newClassName, newSmaliContent);
+        
+        Log.d(TAG, "Renamed class: " + oldClassName + " -> " + newClassName);
+    }
+
+    /**
+     * 修改 APK 中的资源文件
+     */
+    public JSObject modifyResourceInApk(String apkPath, String resourcePath, String newContent) throws Exception {
+        JSObject result = new JSObject();
+        
+        // 注意：这是一个简化实现，实际上修改二进制 XML 需要使用 AXML 编码
+        // 这里仅支持非编译的文本文件（如 assets 中的文件）
+        
+        java.io.File apkFile = new java.io.File(apkPath);
+        java.io.File tempApkFile = new java.io.File(apkPath + ".tmp");
+        
+        java.util.zip.ZipInputStream zis = new java.util.zip.ZipInputStream(new java.io.FileInputStream(apkFile));
+        java.util.zip.ZipOutputStream zos = new java.util.zip.ZipOutputStream(new java.io.FileOutputStream(tempApkFile));
+        
+        java.util.zip.ZipEntry entry;
+        boolean found = false;
+        
+        while ((entry = zis.getNextEntry()) != null) {
+            String entryName = entry.getName();
+            
+            if (entryName.equals(resourcePath) || entryName.equals(resourcePath.replaceFirst("^/+", ""))) {
+                // 替换资源内容
+                java.util.zip.ZipEntry newEntry = new java.util.zip.ZipEntry(entryName);
+                byte[] contentBytes = newContent.getBytes("UTF-8");
+                newEntry.setSize(contentBytes.length);
+                zos.putNextEntry(newEntry);
+                zos.write(contentBytes);
+                zos.closeEntry();
+                found = true;
+            } else {
+                // 复制原内容
+                java.util.zip.ZipEntry newEntry = new java.util.zip.ZipEntry(entryName);
+                if (entry.getMethod() == java.util.zip.ZipEntry.STORED) {
+                    newEntry.setMethod(java.util.zip.ZipEntry.STORED);
+                    newEntry.setSize(entry.getSize());
+                    newEntry.setCrc(entry.getCrc());
+                }
+                zos.putNextEntry(newEntry);
+                
+                byte[] buffer = new byte[8192];
+                int len;
+                while ((len = zis.read(buffer)) > 0) {
+                    zos.write(buffer, 0, len);
+                }
+                zos.closeEntry();
+            }
+        }
+        
+        zis.close();
+        zos.close();
+        
+        if (!found) {
+            tempApkFile.delete();
+            result.put("success", false);
+            result.put("error", "资源文件未找到: " + resourcePath);
+            return result;
+        }
+        
+        // 替换原文件
+        if (!apkFile.delete()) {
+            tempApkFile.delete();
+            result.put("success", false);
+            result.put("error", "无法删除原 APK");
+            return result;
+        }
+        
+        if (!tempApkFile.renameTo(apkFile)) {
+            copyFile(tempApkFile, apkFile);
+            tempApkFile.delete();
+        }
+        
+        result.put("success", true);
+        result.put("message", "资源文件已修改");
+        result.put("needSign", true);
+        return result;
+    }
+
+    /**
+     * 从 APK 中删除指定文件
+     */
+    public JSObject deleteFileFromApk(String apkPath, String filePath) throws Exception {
+        JSObject result = new JSObject();
+        
+        java.io.File apkFile = new java.io.File(apkPath);
+        java.io.File tempApkFile = new java.io.File(apkPath + ".tmp");
+        
+        java.util.zip.ZipInputStream zis = new java.util.zip.ZipInputStream(new java.io.FileInputStream(apkFile));
+        java.util.zip.ZipOutputStream zos = new java.util.zip.ZipOutputStream(new java.io.FileOutputStream(tempApkFile));
+        
+        java.util.zip.ZipEntry entry;
+        boolean found = false;
+        String normalizedPath = filePath.replaceFirst("^/+", "");
+        
+        while ((entry = zis.getNextEntry()) != null) {
+            String entryName = entry.getName();
+            
+            if (entryName.equals(filePath) || entryName.equals(normalizedPath)) {
+                // 跳过要删除的文件
+                found = true;
+                continue;
+            }
+            
+            // 复制其他文件
+            java.util.zip.ZipEntry newEntry = new java.util.zip.ZipEntry(entryName);
+            if (entry.getMethod() == java.util.zip.ZipEntry.STORED) {
+                newEntry.setMethod(java.util.zip.ZipEntry.STORED);
+                newEntry.setSize(entry.getSize());
+                newEntry.setCrc(entry.getCrc());
+            }
+            zos.putNextEntry(newEntry);
+            
+            byte[] buffer = new byte[8192];
+            int len;
+            while ((len = zis.read(buffer)) > 0) {
+                zos.write(buffer, 0, len);
+            }
+            zos.closeEntry();
+        }
+        
+        zis.close();
+        zos.close();
+        
+        if (!found) {
+            tempApkFile.delete();
+            result.put("success", false);
+            result.put("error", "文件未找到: " + filePath);
+            return result;
+        }
+        
+        // 替换原文件
+        if (!apkFile.delete()) {
+            tempApkFile.delete();
+            result.put("success", false);
+            result.put("error", "无法删除原 APK");
+            return result;
+        }
+        
+        if (!tempApkFile.renameTo(apkFile)) {
+            copyFile(tempApkFile, apkFile);
+            tempApkFile.delete();
+        }
+        
+        result.put("success", true);
+        result.put("message", "文件已删除: " + filePath);
+        result.put("needSign", true);
+        return result;
+    }
+
+    /**
+     * 向 APK 中添加或替换文件
+     */
+    public JSObject addFileToApk(String apkPath, String filePath, String content, boolean isBase64) throws Exception {
+        JSObject result = new JSObject();
+        
+        // 解码内容
+        byte[] contentBytes;
+        if (isBase64) {
+            contentBytes = android.util.Base64.decode(content, android.util.Base64.DEFAULT);
+        } else {
+            contentBytes = content.getBytes("UTF-8");
+        }
+        
+        java.io.File apkFile = new java.io.File(apkPath);
+        java.io.File tempApkFile = new java.io.File(apkPath + ".tmp");
+        
+        java.util.zip.ZipInputStream zis = new java.util.zip.ZipInputStream(new java.io.FileInputStream(apkFile));
+        java.util.zip.ZipOutputStream zos = new java.util.zip.ZipOutputStream(new java.io.FileOutputStream(tempApkFile));
+        
+        java.util.zip.ZipEntry entry;
+        String normalizedPath = filePath.replaceFirst("^/+", "");
+        boolean replaced = false;
+        
+        while ((entry = zis.getNextEntry()) != null) {
+            String entryName = entry.getName();
+            
+            if (entryName.equals(filePath) || entryName.equals(normalizedPath)) {
+                // 跳过要替换的文件，稍后添加新版本
+                replaced = true;
+                continue;
+            }
+            
+            // 复制其他文件
+            java.util.zip.ZipEntry newEntry = new java.util.zip.ZipEntry(entryName);
+            if (entry.getMethod() == java.util.zip.ZipEntry.STORED) {
+                newEntry.setMethod(java.util.zip.ZipEntry.STORED);
+                newEntry.setSize(entry.getSize());
+                newEntry.setCrc(entry.getCrc());
+            }
+            zos.putNextEntry(newEntry);
+            
+            byte[] buffer = new byte[8192];
+            int len;
+            while ((len = zis.read(buffer)) > 0) {
+                zos.write(buffer, 0, len);
+            }
+            zos.closeEntry();
+        }
+        
+        // 添加新文件
+        java.util.zip.ZipEntry newEntry = new java.util.zip.ZipEntry(normalizedPath);
+        newEntry.setSize(contentBytes.length);
+        zos.putNextEntry(newEntry);
+        zos.write(contentBytes);
+        zos.closeEntry();
+        
+        zis.close();
+        zos.close();
+        
+        // 替换原文件
+        if (!apkFile.delete()) {
+            tempApkFile.delete();
+            result.put("success", false);
+            result.put("error", "无法删除原 APK");
+            return result;
+        }
+        
+        if (!tempApkFile.renameTo(apkFile)) {
+            copyFile(tempApkFile, apkFile);
+            tempApkFile.delete();
+        }
+        
+        result.put("success", true);
+        result.put("message", replaced ? "文件已替换: " + filePath : "文件已添加: " + filePath);
+        result.put("needSign", true);
+        return result;
+    }
+
+    /**
+     * 保存多 DEX 会话的修改到 APK
+     */
+    public JSObject saveMultiDexSessionToApk(String sessionId) throws Exception {
+        MultiDexSession session = multiDexSessions.get(sessionId);
+        if (session == null) {
+            throw new IllegalArgumentException("Session not found: " + sessionId);
+        }
+        
+        if (!session.modified || session.modifiedClasses.isEmpty()) {
+            JSObject result = new JSObject();
+            result.put("success", true);
+            result.put("message", "没有需要保存的修改");
+            return result;
+        }
+        
+        // 按 DEX 文件分组修改
+        Map<String, List<ClassDef>> modifiedByDex = new HashMap<>();
+        for (Map.Entry<String, ClassDef> entry : session.modifiedClasses.entrySet()) {
+            String[] parts = entry.getKey().split("\\|");
+            String dexName = parts[0];
+            modifiedByDex.computeIfAbsent(dexName, k -> new ArrayList<>()).add(entry.getValue());
+        }
+        
+        // 为每个修改的 DEX 创建新版本
+        Map<String, byte[]> newDexData = new HashMap<>();
+        
+        for (Map.Entry<String, List<ClassDef>> entry : modifiedByDex.entrySet()) {
+            String dexName = entry.getKey();
+            List<ClassDef> modifiedClasses = entry.getValue();
+            DexBackedDexFile originalDex = session.dexFiles.get(dexName);
+            
+            // 合并类
+            Set<String> modifiedTypes = new HashSet<>();
+            for (ClassDef c : modifiedClasses) {
+                modifiedTypes.add(c.getType());
+            }
+            
+            List<ClassDef> allClasses = new ArrayList<>(modifiedClasses);
+            for (ClassDef c : originalDex.getClasses()) {
+                if (!modifiedTypes.contains(c.getType())) {
+                    allClasses.add(c);
+                }
+            }
+            
+            // 创建新 DEX
+            reportTitle("编译 " + dexName);
+            reportMessage("正在编译类...");
+            
+            java.io.File tempDex = java.io.File.createTempFile("dex_", ".dex");
+            DexPool dexPool = new DexPool(Opcodes.getDefault());
+            int total = allClasses.size();
+            int current = 0;
+            for (ClassDef c : allClasses) {
+                dexPool.internClass(c);
+                current++;
+                reportProgress(current, total);
+            }
+            
+            reportMessage("正在写入文件...");
+            dexPool.writeTo(new FileDataStore(tempDex));
+            
+            newDexData.put(dexName, readFileBytes(tempDex));
+            tempDex.delete();
+        }
+        
+        reportTitle("更新 APK");
+        reportMessage("正在替换 DEX 文件...");
+        
+        // 替换 APK 中的 DEX
+        java.io.File apkFile = new java.io.File(session.apkPath);
+        java.io.File tempApk = new java.io.File(session.apkPath + ".tmp");
+        
+        java.util.zip.ZipInputStream zis = new java.util.zip.ZipInputStream(
+            new java.io.BufferedInputStream(new java.io.FileInputStream(apkFile)));
+        java.util.zip.ZipOutputStream zos = new java.util.zip.ZipOutputStream(
+            new java.io.BufferedOutputStream(new java.io.FileOutputStream(tempApk)));
+        
+        java.util.zip.ZipEntry entry;
+        while ((entry = zis.getNextEntry()) != null) {
+            if (newDexData.containsKey(entry.getName())) {
+                // 替换 DEX
+                byte[] dexBytes = newDexData.get(entry.getName());
+                java.util.zip.ZipEntry newEntry = new java.util.zip.ZipEntry(entry.getName());
+                newEntry.setMethod(java.util.zip.ZipEntry.DEFLATED);
+                zos.putNextEntry(newEntry);
+                zos.write(dexBytes);
+                zos.closeEntry();
+            } else {
+                // 复制原条目
+                java.util.zip.ZipEntry newEntry = new java.util.zip.ZipEntry(entry.getName());
+                newEntry.setTime(entry.getTime());
+                if (entry.getMethod() == java.util.zip.ZipEntry.STORED) {
+                    newEntry.setMethod(java.util.zip.ZipEntry.STORED);
+                    newEntry.setSize(entry.getSize());
+                    newEntry.setCrc(entry.getCrc());
+                } else {
+                    newEntry.setMethod(java.util.zip.ZipEntry.DEFLATED);
+                }
+                zos.putNextEntry(newEntry);
+                if (!entry.isDirectory()) {
+                    byte[] buf = new byte[8192];
+                    int n;
+                    while ((n = zis.read(buf)) != -1) {
+                        zos.write(buf, 0, n);
+                    }
+                }
+                zos.closeEntry();
+            }
+            zis.closeEntry();
+        }
+        
+        zis.close();
+        zos.close();
+        
+        // 替换原文件
+        if (!apkFile.delete()) {
+            Log.e(TAG, "Failed to delete original APK");
+        }
+        if (!tempApk.renameTo(apkFile)) {
+            copyFile(tempApk, apkFile);
+            tempApk.delete();
+        }
+        
+        // 清除修改状态
+        session.modifiedClasses.clear();
+        session.modified = false;
+        
+        JSObject result = new JSObject();
+        result.put("success", true);
+        result.put("message", "DEX 已保存到 APK");
+        result.put("apkPath", session.apkPath);
+        result.put("needSign", true);
+        
+        return result;
+    }
+
+    /**
+     * 将 DEX 类型格式转换为 Java 类名格式
+     * 例如: Lcom/example/Class; -> com.example.Class
+     */
+    private String convertTypeToClassName(String type) {
+        if (type == null) return "";
+        String className = type;
+        if (className.startsWith("L") && className.endsWith(";")) {
+            className = className.substring(1, className.length() - 1);
+        }
+        return className.replace("/", ".");
+    }
+
+    /**
+     * 将 Java 类名格式转换为 DEX 类型格式
+     * 例如: com.example.Class -> Lcom/example/Class;
+     */
+    private String convertClassNameToType(String className) {
+        if (className == null) return "";
+        return "L" + className.replace(".", "/") + ";";
+    }
+
+    /**
+     * 获取或创建 APK DEX 缓存
+     */
+    private ApkDexCache getOrCreateDexCache(String apkPath, String dexPath) throws Exception {
+        String cacheKey = apkPath + ":" + dexPath;
+        java.io.File apkFile = new java.io.File(apkPath);
+        long currentModified = apkFile.lastModified();
+        
+        ApkDexCache cache = apkDexCaches.get(cacheKey);
+        
+        // 检查缓存是否有效
+        if (cache != null && cache.lastModified == currentModified && !cache.classDefMap.isEmpty()) {
+            Log.d(TAG, "Using DEX cache for: " + cacheKey + " (" + cache.classDefMap.size() + " classes)");
+            return cache;
+        }
+        
+        // 需要重新加载
+        Log.d(TAG, "Loading DEX into cache: " + cacheKey);
+        cache = new ApkDexCache(apkPath, dexPath);
+        cache.lastModified = currentModified;
+        
+        java.util.zip.ZipFile zipFile = new java.util.zip.ZipFile(apkPath);
+        try {
+            // 尝试多种可能的 dexPath 格式
+            java.util.zip.ZipEntry dexEntry = zipFile.getEntry(dexPath);
+            if (dexEntry == null) {
+                dexEntry = zipFile.getEntry(dexPath.replaceFirst("^/+", ""));
+            }
+            if (dexEntry == null) {
+                String fileName = dexPath;
+                if (dexPath.contains("/")) {
+                    fileName = dexPath.substring(dexPath.lastIndexOf("/") + 1);
+                }
+                dexEntry = zipFile.getEntry(fileName);
+            }
+            
+            if (dexEntry == null) {
+                throw new Exception("DEX 文件未找到: " + dexPath);
+            }
+            
+            // 读取 DEX 文件
+            java.io.InputStream dexInputStream = zipFile.getInputStream(dexEntry);
+            java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+            byte[] buffer = new byte[16384];
+            int len;
+            while ((len = dexInputStream.read(buffer)) != -1) {
+                baos.write(buffer, 0, len);
+            }
+            dexInputStream.close();
+            byte[] dexBytes = baos.toByteArray();
+            
+            // 解析 DEX 文件并缓存所有 ClassDef
+            DexBackedDexFile dexFile = new DexBackedDexFile(Opcodes.getDefault(), dexBytes);
+            cache.dexVersion = 35; // 默认 DEX 版本
+            
+            for (ClassDef classDef : dexFile.getClasses()) {
+                cache.classDefMap.put(classDef.getType(), classDef);
+            }
+            
+            Log.d(TAG, "Cached " + cache.classDefMap.size() + " classes from " + dexPath);
+        } finally {
+            zipFile.close();
+        }
+        
+        apkDexCaches.put(cacheKey, cache);
+        return cache;
+    }
+    
+    /**
+     * 清除指定 APK 的 DEX 缓存
+     */
+    public void clearDexCache(String apkPath) {
+        java.util.Iterator<String> it = apkDexCaches.keySet().iterator();
+        while (it.hasNext()) {
+            if (it.next().startsWith(apkPath + ":")) {
+                it.remove();
+            }
+        }
+        Log.d(TAG, "Cleared DEX cache for: " + apkPath);
+    }
+    
+    /**
+     * 从 APK 中的 DEX 文件获取类的 Smali 代码（使用缓存）
+     */
+    public JSObject getClassSmaliFromApk(String apkPath, String dexPath, String className) throws Exception {
+        JSObject result = new JSObject();
+        
+        Log.d(TAG, "getClassSmaliFromApk: apkPath=" + apkPath + ", dexPath=" + dexPath + ", className=" + className);
+        
+        if (className == null || className.isEmpty()) {
+            result.put("smali", "# 未指定类名");
+            return result;
+        }
+        
+        String targetType = convertClassNameToType(className);
+        
+        try {
+            // 使用缓存获取 ClassDef
+            ApkDexCache cache = getOrCreateDexCache(apkPath, dexPath);
+            ClassDef targetClass = cache.classDefMap.get(targetType);
+            
+            if (targetClass == null) {
+                result.put("smali", "# 类未找到: " + className + "\n# 目标类型: " + targetType);
+                return result;
+            }
+            
+            // 使用 baksmali 库生成正确的 Smali 代码
+            BaksmaliOptions options = new BaksmaliOptions();
+            ClassDefinition classDefinition = new ClassDefinition(options, targetClass);
+            
+            java.io.StringWriter stringWriter = new java.io.StringWriter();
+            BaksmaliWriter writer = new BaksmaliWriter(stringWriter, null);
+            classDefinition.writeTo(writer);
+            writer.close();
+            
+            result.put("smali", stringWriter.toString());
+            
+        } catch (Exception e) {
+            result.put("smali", "# 加载失败: " + e.getMessage());
+        }
+        
+        return result;
+    }
+
+    /**
+     * 保存修改后的 Smali 代码到 APK 中的 DEX 文件
+     * 注意：这是一个复杂操作，需要重新编译 Smali 并修改 DEX 文件
+     */
+    public JSObject saveClassSmaliToApk(String apkPath, String dexPath, String className, String smaliContent) throws Exception {
+        JSObject result = new JSObject();
+        
+        Log.d(TAG, "saveClassSmaliToApk: apkPath=" + apkPath + ", dexPath=" + dexPath + ", className=" + className);
+        Log.d(TAG, "smaliContent length: " + (smaliContent != null ? smaliContent.length() : 0));
+        
+        if (className == null || className.isEmpty()) {
+            result.put("success", false);
+            result.put("error", "未指定类名");
+            return result;
+        }
+        
+        if (smaliContent == null || smaliContent.isEmpty()) {
+            result.put("success", false);
+            result.put("error", "Smali 内容为空");
+            return result;
+        }
+        
+        try {
+            // 使用优化的 smali2.Smali 直接编译成 ClassDef（无需临时文件）
+            reportTitle("编译 Smali");
+            reportMessage("正在编译 " + className + "...");
+            reportProgress(10, 100);
+            
+            com.android.tools.smali.smali.SmaliOptions options = new com.android.tools.smali.smali.SmaliOptions();
+            options.apiLevel = 30;
+            
+            // 直接编译 Smali 代码为 ClassDef
+            ClassDef newClassDef;
+            try {
+                newClassDef = com.android.tools.smali.smali2.Smali.assemble(smaliContent, options, 35);
+            } catch (Exception e) {
+                result.put("success", false);
+                result.put("error", "Smali 编译失败: " + e.getMessage());
+                return result;
+            }
+            
+            reportProgress(20, 100);
+            Log.d(TAG, "Smali compiled successfully to ClassDef");
+            
+            // 使用缓存获取 ClassDef（核心优化）
+            reportTitle("合并 DEX");
+            reportMessage("获取缓存...");
+            
+            String targetType = "L" + className.replace(".", "/") + ";";
+            ApkDexCache cache = getOrCreateDexCache(apkPath, dexPath);
+            
+            reportProgress(30, 100);
+            reportMessage("更新缓存...");
+            
+            // 更新缓存中的 ClassDef
+            cache.classDefMap.put(targetType, newClassDef);
+            
+            Log.d(TAG, "Using cached " + cache.classDefMap.size() + " classes");
+            
+            // 创建新的 DEX 文件（使用缓存的 ClassDef）
+            reportMessage("写入 DEX (" + cache.classDefMap.size() + " 个类)...");
+            reportProgress(40, 100);
+            
+            DexPool dexPool = new DexPool(Opcodes.getDefault());
+            int totalClasses = cache.classDefMap.size();
+            int currentClass = 0;
+            for (ClassDef classDef : cache.classDefMap.values()) {
+                dexPool.internClass(classDef);
+                currentClass++;
+                if (currentClass % 200 == 0 || currentClass == totalClasses) {
+                    reportProgress(40 + (currentClass * 40 / totalClasses), 100);
+                }
+            }
+            
+            // 使用内存写入 DEX（避免临时文件）
+            reportProgress(80, 100);
+            reportMessage("生成 DEX...");
+            com.android.tools.smali.dexlib2.writer.io.MemoryDataStore memoryStore = 
+                new com.android.tools.smali.dexlib2.writer.io.MemoryDataStore();
+            dexPool.writeTo(memoryStore);
+            byte[] newDexBytes = java.util.Arrays.copyOf(memoryStore.getBuffer(), memoryStore.getSize());
+            
+            Log.d(TAG, "Merged DEX size: " + newDexBytes.length + " bytes");
+            
+            // MT 风格：直接替换 APK 内的 DEX
+            reportTitle("更新 APK");
+            reportMessage("正在替换 DEX...");
+            reportProgress(85, 100);
+            
+            java.io.File apkFile = new java.io.File(apkPath);
+            java.io.File tempApkFile = new java.io.File(apkPath + ".tmp");
+            
+            Log.d(TAG, "Replacing DEX in APK (MT style)...");
+            
+            // 使用 ZipInputStream 流式处理替换 DEX
+            java.util.zip.ZipInputStream zis = new java.util.zip.ZipInputStream(
+                new java.io.BufferedInputStream(new java.io.FileInputStream(apkFile)));
+            java.util.zip.ZipOutputStream zos = new java.util.zip.ZipOutputStream(
+                new java.io.BufferedOutputStream(new java.io.FileOutputStream(tempApkFile)));
+            
+            java.util.zip.ZipEntry entry;
+            while ((entry = zis.getNextEntry()) != null) {
+                if (entry.getName().equals(dexPath)) {
+                    // 替换 DEX：写入新数据
+                    java.util.zip.ZipEntry newEntry = new java.util.zip.ZipEntry(dexPath);
+                    newEntry.setMethod(java.util.zip.ZipEntry.DEFLATED);
+                    zos.putNextEntry(newEntry);
+                    zos.write(newDexBytes);
+                    zos.closeEntry();
+                    zis.closeEntry();
+                } else {
+                    // 直接复制其他条目
+                    java.util.zip.ZipEntry newEntry = new java.util.zip.ZipEntry(entry.getName());
+                    newEntry.setTime(entry.getTime());
+                    if (entry.getMethod() == java.util.zip.ZipEntry.STORED) {
+                        newEntry.setMethod(java.util.zip.ZipEntry.STORED);
+                        newEntry.setSize(entry.getSize());
+                        newEntry.setCrc(entry.getCrc());
+                    } else {
+                        newEntry.setMethod(java.util.zip.ZipEntry.DEFLATED);
+                    }
+                    zos.putNextEntry(newEntry);
+                    if (!entry.isDirectory()) {
+                        byte[] buf = new byte[8192];
+                        int n;
+                        while ((n = zis.read(buf)) != -1) {
+                            zos.write(buf, 0, n);
+                        }
+                    }
+                    zos.closeEntry();
+                }
+            }
+            
+            zis.close();
+            zos.close();
+            
+            // 用临时文件替换原文件
+            if (!apkFile.delete()) {
+                Log.e(TAG, "Failed to delete original APK");
+            }
+            if (!tempApkFile.renameTo(apkFile)) {
+                copyFile(tempApkFile, apkFile);
+                tempApkFile.delete();
+            }
+            
+            Log.d(TAG, "APK updated successfully: " + apkPath);
+            reportProgress(100, 100);
+            
+            // 更新缓存的 lastModified 以匹配新的 APK
+            cache.lastModified = new java.io.File(apkPath).lastModified();
+            
+            result.put("success", true);
+            result.put("message", "Smali 编译成功！APK 已更新");
+            result.put("apkPath", apkPath);
+            result.put("needSign", true);
+            
+        } catch (Exception e) {
+            Log.e(TAG, "Error saving smali: " + e.getMessage(), e);
+            result.put("success", false);
+            result.put("error", "保存失败: " + e.getMessage());
+        }
+        
+        return result;
+    }
+
+    /**
+     * 读取文件为字节数组
+     */
+    private byte[] readFileBytes(java.io.File file) throws java.io.IOException {
+        java.io.FileInputStream fis = new java.io.FileInputStream(file);
+        java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+        byte[] buffer = new byte[8192];
+        int len;
+        while ((len = fis.read(buffer)) != -1) {
+            baos.write(buffer, 0, len);
+        }
+        fis.close();
+        return baos.toByteArray();
+    }
+
+    /**
+     * 计算 CRC32
+     */
+    private long calculateCrc32(byte[] data) {
+        java.util.zip.CRC32 crc = new java.util.zip.CRC32();
+        crc.update(data);
+        return crc.getValue();
+    }
+
+    /**
+     * 复制文件
+     */
+    private void copyFile(java.io.File src, java.io.File dst) throws java.io.IOException {
+        java.io.FileInputStream fis = new java.io.FileInputStream(src);
+        java.io.FileOutputStream fos = new java.io.FileOutputStream(dst);
+        byte[] buffer = new byte[8192];
+        int len;
+        while ((len = fis.read(buffer)) != -1) {
+            fos.write(buffer, 0, len);
+        }
+        fis.close();
+        fos.close();
+    }
+
+    // ==================== XML/资源操作方法 ====================
+
+    /**
+     * 获取 APK 的 AndroidManifest.xml（解码为可读 XML）
+     */
+    public JSObject getManifestFromApk(String apkPath) throws Exception {
+        JSObject result = new JSObject();
+        
+        java.util.zip.ZipFile zipFile = null;
+        try {
+            zipFile = new java.util.zip.ZipFile(apkPath);
+            java.util.zip.ZipEntry manifestEntry = zipFile.getEntry("AndroidManifest.xml");
+            
+            if (manifestEntry == null) {
+                throw new Exception("AndroidManifest.xml not found in APK");
+            }
+            
+            java.io.InputStream is = zipFile.getInputStream(manifestEntry);
+            java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+            byte[] buffer = new byte[8192];
+            int len;
+            while ((len = is.read(buffer)) != -1) {
+                baos.write(buffer, 0, len);
+            }
+            is.close();
+            
+            // 解析二进制 AXML
+            byte[] axmlData = baos.toByteArray();
+            String xmlContent = decodeAxml(axmlData);
+            
+            result.put("manifest", xmlContent);
+            
+        } finally {
+            if (zipFile != null) {
+                try { zipFile.close(); } catch (Exception ignored) {}
+            }
+        }
+        
+        return result;
+    }
+
+    /**
+     * 获取 Manifest 的回退实现（使用简单 AXML 解析器）
+     */
+    private String getManifestFallback(String apkPath) {
+        java.util.zip.ZipFile zipFile = null;
+        try {
+            zipFile = new java.util.zip.ZipFile(apkPath);
+            java.util.zip.ZipEntry manifestEntry = zipFile.getEntry("AndroidManifest.xml");
+            
+            if (manifestEntry == null) {
+                return "# AndroidManifest.xml not found";
+            }
+            
+            java.io.InputStream is = zipFile.getInputStream(manifestEntry);
+            java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+            byte[] buffer = new byte[8192];
+            int len;
+            while ((len = is.read(buffer)) != -1) {
+                baos.write(buffer, 0, len);
+            }
+            is.close();
+            
+            return decodeAxml(baos.toByteArray());
+            
+        } catch (Exception e) {
+            return "# Error reading manifest: " + e.getMessage();
+        } finally {
+            if (zipFile != null) {
+                try { zipFile.close(); } catch (Exception ignored) {}
+            }
+        }
+    }
+
+    /**
+     * 解码二进制 AXML 为可读 XML（使用内置解析器）
+     */
+    private String decodeAxml(byte[] axmlData) {
+        try {
+            return AxmlParser.decode(axmlData);
+        } catch (Exception e) {
+            Log.e(TAG, "AXML decode error: " + e.getMessage());
+            return "# 无法解码 AXML: " + e.getMessage();
+        }
+    }
+
+    /**
+     * 修改 AndroidManifest.xml
+     */
+    public JSObject modifyManifestInApk(String apkPath, String newManifestXml) throws Exception {
+        JSObject result = new JSObject();
+        
+        try {
+            // 将 XML 编码为二进制 AXML
+            byte[] newAxmlData = encodeAxml(newManifestXml);
+            
+            // 替换 APK 中的 AndroidManifest.xml
+            java.io.File apkFile = new java.io.File(apkPath);
+            java.io.File tempApk = new java.io.File(apkPath + ".tmp");
+            
+            java.util.zip.ZipInputStream zis = new java.util.zip.ZipInputStream(
+                new java.io.BufferedInputStream(new java.io.FileInputStream(apkFile)));
+            java.util.zip.ZipOutputStream zos = new java.util.zip.ZipOutputStream(
+                new java.io.BufferedOutputStream(new java.io.FileOutputStream(tempApk)));
+            
+            java.util.zip.ZipEntry entry;
+            while ((entry = zis.getNextEntry()) != null) {
+                if (entry.getName().equals("AndroidManifest.xml")) {
+                    // 替换 Manifest
+                    java.util.zip.ZipEntry newEntry = new java.util.zip.ZipEntry("AndroidManifest.xml");
+                    newEntry.setMethod(java.util.zip.ZipEntry.DEFLATED);
+                    zos.putNextEntry(newEntry);
+                    zos.write(newAxmlData);
+                    zos.closeEntry();
+                } else {
+                    // 复制其他文件
+                    java.util.zip.ZipEntry newEntry = new java.util.zip.ZipEntry(entry.getName());
+                    newEntry.setTime(entry.getTime());
+                    if (entry.getMethod() == java.util.zip.ZipEntry.STORED) {
+                        newEntry.setMethod(java.util.zip.ZipEntry.STORED);
+                        newEntry.setSize(entry.getSize());
+                        newEntry.setCrc(entry.getCrc());
+                    } else {
+                        newEntry.setMethod(java.util.zip.ZipEntry.DEFLATED);
+                    }
+                    zos.putNextEntry(newEntry);
+                    if (!entry.isDirectory()) {
+                        byte[] buf = new byte[8192];
+                        int n;
+                        while ((n = zis.read(buf)) != -1) {
+                            zos.write(buf, 0, n);
+                        }
+                    }
+                    zos.closeEntry();
+                }
+                zis.closeEntry();
+            }
+            
+            zis.close();
+            zos.close();
+            
+            // 替换原文件
+            if (!apkFile.delete()) {
+                Log.e(TAG, "Failed to delete original APK");
+            }
+            if (!tempApk.renameTo(apkFile)) {
+                copyFile(tempApk, apkFile);
+                tempApk.delete();
+            }
+            
+            result.put("success", true);
+            result.put("message", "AndroidManifest.xml 已修改");
+            
+        } catch (Exception e) {
+            Log.e(TAG, "Modify manifest error: " + e.getMessage(), e);
+            result.put("success", false);
+            result.put("error", e.getMessage());
+        }
+        
+        return result;
+    }
+
+    /**
+     * 将 XML 编码为二进制 AXML
+     * 注意：AXML 编码比较复杂，暂时不支持修改功能
+     */
+    private byte[] encodeAxml(String xmlContent) throws Exception {
+        throw new UnsupportedOperationException("AXML 编码功能暂不支持，请使用 APKTool 进行 Manifest 修改");
+    }
+
+    /**
+     * 列出 APK 中的资源文件
+     */
+    public JSObject listResourcesInApk(String apkPath, String filter) throws Exception {
+        JSObject result = new JSObject();
+        JSArray resources = new JSArray();
+        
+        java.util.zip.ZipFile zipFile = null;
+        try {
+            zipFile = new java.util.zip.ZipFile(apkPath);
+            java.util.Enumeration<? extends java.util.zip.ZipEntry> entries = zipFile.entries();
+            
+            while (entries.hasMoreElements()) {
+                java.util.zip.ZipEntry entry = entries.nextElement();
+                String name = entry.getName();
+                
+                // 只列出 res 目录下的文件
+                if (name.startsWith("res/")) {
+                    // 过滤
+                    if (filter != null && !filter.isEmpty()) {
+                        if (!name.contains(filter)) {
+                            continue;
+                        }
+                    }
+                    
+                    JSObject resource = new JSObject();
+                    resource.put("path", name);
+                    resource.put("size", entry.getSize());
+                    resource.put("isXml", name.endsWith(".xml"));
+                    resources.put(resource);
+                }
+            }
+            
+            result.put("total", resources.length());
+            result.put("resources", resources);
+            
+        } finally {
+            if (zipFile != null) {
+                try { zipFile.close(); } catch (Exception ignored) {}
+            }
+        }
+        
+        return result;
+    }
+
+    /**
+     * 获取 APK 中的资源文件内容
+     */
+    public JSObject getResourceFromApk(String apkPath, String resourcePath) throws Exception {
+        JSObject result = new JSObject();
+        
+        java.util.zip.ZipFile zipFile = null;
+        try {
+            zipFile = new java.util.zip.ZipFile(apkPath);
+            java.util.zip.ZipEntry entry = zipFile.getEntry(resourcePath);
+            
+            if (entry == null) {
+                throw new Exception("Resource not found: " + resourcePath);
+            }
+            
+            java.io.InputStream is = zipFile.getInputStream(entry);
+            java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+            byte[] buffer = new byte[8192];
+            int len;
+            while ((len = is.read(buffer)) != -1) {
+                baos.write(buffer, 0, len);
+            }
+            is.close();
+            
+            byte[] data = baos.toByteArray();
+            
+            // 如果是 XML 文件，尝试解码 AXML
+            if (resourcePath.endsWith(".xml")) {
+                String xmlContent = decodeAxml(data);
+                result.put("content", xmlContent);
+                result.put("type", "xml");
+            } else {
+                // 其他文件返回 base64
+                result.put("content", android.util.Base64.encodeToString(data, android.util.Base64.NO_WRAP));
+                result.put("type", "binary");
+            }
+            
+            result.put("path", resourcePath);
+            result.put("size", data.length);
+            
+        } finally {
+            if (zipFile != null) {
+                try { zipFile.close(); } catch (Exception ignored) {}
+            }
+        }
+        
+        return result;
+    }
+
+    /**
+     * 精准替换 AndroidManifest.xml 中的字符串（二进制替换，支持任意长度）
+     */
+    public JSObject replaceInManifest(String apkPath, org.json.JSONArray replacements) throws Exception {
+        JSObject result = new JSObject();
+        JSArray details = new JSArray();
+        int replacedCount = 0;
+        
+        try {
+            // 读取 APK 中的 AndroidManifest.xml
+            java.util.zip.ZipFile zipFile = new java.util.zip.ZipFile(apkPath);
+            java.util.zip.ZipEntry manifestEntry = zipFile.getEntry("AndroidManifest.xml");
+            
+            if (manifestEntry == null) {
+                zipFile.close();
+                throw new Exception("AndroidManifest.xml not found in APK");
+            }
+            
+            // 读取 AXML 数据
+            java.io.InputStream is = zipFile.getInputStream(manifestEntry);
+            java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+            byte[] buffer = new byte[8192];
+            int len;
+            while ((len = is.read(buffer)) != -1) {
+                baos.write(buffer, 0, len);
+            }
+            is.close();
+            zipFile.close();
+            
+            byte[] axmlData = baos.toByteArray();
+            
+            // 使用 AxmlEditor 执行替换（支持任意长度）
+            AxmlEditor editor = new AxmlEditor(axmlData);
+            
+            for (int i = 0; i < replacements.length(); i++) {
+                org.json.JSONObject replacement = replacements.getJSONObject(i);
+                String oldValue = replacement.getString("oldValue");
+                String newValue = replacement.getString("newValue");
+                
+                int count = editor.replaceString(oldValue, newValue);
+                
+                JSObject detail = new JSObject();
+                detail.put("oldValue", oldValue);
+                detail.put("newValue", newValue);
+                detail.put("count", count);
+                details.put(detail);
+                
+                replacedCount += count;
+            }
+            
+            if (replacedCount == 0) {
+                result.put("success", true);
+                result.put("replacedCount", 0);
+                result.put("details", details);
+                result.put("message", "未找到匹配的字符串");
+                return result;
+            }
+            
+            // 获取修改后的数据
+            byte[] modifiedData = editor.build();
+            
+            // 替换 APK 中的 AndroidManifest.xml
+            java.io.File apkFile = new java.io.File(apkPath);
+            java.io.File tempApk = new java.io.File(apkPath + ".tmp");
+            
+            java.util.zip.ZipInputStream zis = new java.util.zip.ZipInputStream(
+                new java.io.BufferedInputStream(new java.io.FileInputStream(apkFile)));
+            java.util.zip.ZipOutputStream zos = new java.util.zip.ZipOutputStream(
+                new java.io.BufferedOutputStream(new java.io.FileOutputStream(tempApk)));
+            
+            java.util.zip.ZipEntry entry;
+            while ((entry = zis.getNextEntry()) != null) {
+                if (entry.getName().equals("AndroidManifest.xml")) {
+                    // 写入修改后的 Manifest
+                    java.util.zip.ZipEntry newEntry = new java.util.zip.ZipEntry("AndroidManifest.xml");
+                    newEntry.setMethod(java.util.zip.ZipEntry.DEFLATED);
+                    zos.putNextEntry(newEntry);
+                    zos.write(modifiedData);
+                    zos.closeEntry();
+                } else {
+                    // 复制其他文件
+                    java.util.zip.ZipEntry newEntry = new java.util.zip.ZipEntry(entry.getName());
+                    newEntry.setTime(entry.getTime());
+                    if (entry.getMethod() == java.util.zip.ZipEntry.STORED) {
+                        newEntry.setMethod(java.util.zip.ZipEntry.STORED);
+                        newEntry.setSize(entry.getSize());
+                        newEntry.setCrc(entry.getCrc());
+                    } else {
+                        newEntry.setMethod(java.util.zip.ZipEntry.DEFLATED);
+                    }
+                    zos.putNextEntry(newEntry);
+                    if (!entry.isDirectory()) {
+                        byte[] buf = new byte[8192];
+                        int n;
+                        while ((n = zis.read(buf)) != -1) {
+                            zos.write(buf, 0, n);
+                        }
+                    }
+                    zos.closeEntry();
+                }
+                zis.closeEntry();
+            }
+            
+            zis.close();
+            zos.close();
+            
+            // 替换原文件
+            if (!apkFile.delete()) {
+                Log.e(TAG, "Failed to delete original APK");
+            }
+            if (!tempApk.renameTo(apkFile)) {
+                copyFile(tempApk, apkFile);
+                tempApk.delete();
+            }
+            
+            result.put("success", true);
+            result.put("replacedCount", replacedCount);
+            result.put("details", details);
+            
+        } catch (Exception e) {
+            Log.e(TAG, "Replace in manifest error: " + e.getMessage(), e);
+            result.put("success", false);
+            result.put("error", e.getMessage());
+        }
+        
+        return result;
+    }
+
+    /**
+     * 替换结果
+     */
+    private static class ReplaceResult {
+        byte[] data;
+        int count;
+        
+        ReplaceResult(byte[] data, int count) {
+            this.data = data;
+            this.count = count;
+        }
+    }
+
+    /**
+     * 在 AXML 二进制数据中替换字符串
+     * 直接修改字符串池中的字符串
+     */
+    private ReplaceResult replaceStringInAxml(byte[] data, String oldValue, String newValue) {
+        int count = 0;
+        
+        try {
+            // 解析 AXML 结构找到字符串池
+            if (data.length < 8) return new ReplaceResult(data, 0);
+            
+            // 检查魔数
+            int magic = (data[0] & 0xFF) | ((data[1] & 0xFF) << 8) | 
+                       ((data[2] & 0xFF) << 16) | ((data[3] & 0xFF) << 24);
+            if (magic != 0x00080003) return new ReplaceResult(data, 0);
+            
+            // 找到字符串池 chunk (类型 0x0001)
+            int pos = 8;
+            while (pos < data.length - 8) {
+                int chunkType = (data[pos] & 0xFF) | ((data[pos + 1] & 0xFF) << 8);
+                int headerSize = (data[pos + 2] & 0xFF) | ((data[pos + 3] & 0xFF) << 8);
+                int chunkSize = (data[pos + 4] & 0xFF) | ((data[pos + 5] & 0xFF) << 8) |
+                               ((data[pos + 6] & 0xFF) << 16) | ((data[pos + 7] & 0xFF) << 24);
+                
+                if (chunkType == 0x0001) {
+                    // 字符串池 chunk
+                    int stringCount = (data[pos + 8] & 0xFF) | ((data[pos + 9] & 0xFF) << 8) |
+                                     ((data[pos + 10] & 0xFF) << 16) | ((data[pos + 11] & 0xFF) << 24);
+                    int styleCount = (data[pos + 12] & 0xFF) | ((data[pos + 13] & 0xFF) << 8) |
+                                    ((data[pos + 14] & 0xFF) << 16) | ((data[pos + 15] & 0xFF) << 24);
+                    int flags = (data[pos + 16] & 0xFF) | ((data[pos + 17] & 0xFF) << 8) |
+                               ((data[pos + 18] & 0xFF) << 16) | ((data[pos + 19] & 0xFF) << 24);
+                    int stringsOffset = (data[pos + 20] & 0xFF) | ((data[pos + 21] & 0xFF) << 8) |
+                                       ((data[pos + 22] & 0xFF) << 16) | ((data[pos + 23] & 0xFF) << 24);
+                    
+                    boolean isUtf8 = (flags & 0x100) != 0;
+                    
+                    // 读取字符串偏移表
+                    int offsetTableStart = pos + 28;
+                    int stringsStart = pos + stringsOffset;
+                    
+                    // 遍历所有字符串
+                    for (int i = 0; i < stringCount; i++) {
+                        int offsetPos = offsetTableStart + i * 4;
+                        int stringOffset = (data[offsetPos] & 0xFF) | ((data[offsetPos + 1] & 0xFF) << 8) |
+                                          ((data[offsetPos + 2] & 0xFF) << 16) | ((data[offsetPos + 3] & 0xFF) << 24);
+                        
+                        int stringPos = stringsStart + stringOffset;
+                        if (stringPos >= data.length) continue;
+                        
+                        // 读取当前字符串
+                        String currentString = readStringFromAxml(data, stringPos, isUtf8);
+                        
+                        // 检查是否匹配
+                        if (currentString.equals(oldValue)) {
+                            // 执行替换（仅当新字符串长度 <= 旧字符串长度时可以直接替换）
+                            if (isUtf8) {
+                                byte[] newBytes = newValue.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                                byte[] oldBytes = oldValue.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                                
+                                if (newBytes.length <= oldBytes.length) {
+                                    // 可以直接替换
+                                    int dataStart = getStringDataStart(data, stringPos, isUtf8);
+                                    
+                                    // 更新长度
+                                    if (newBytes.length < 128) {
+                                        data[stringPos] = (byte) newValue.length();
+                                        data[stringPos + 1] = (byte) newBytes.length;
+                                    }
+                                    
+                                    // 写入新数据
+                                    System.arraycopy(newBytes, 0, data, dataStart, newBytes.length);
+                                    
+                                    // 用 0 填充剩余空间
+                                    for (int j = newBytes.length; j < oldBytes.length; j++) {
+                                        data[dataStart + j] = 0;
+                                    }
+                                    
+                                    count++;
+                                } else {
+                                    Log.w(TAG, "New string is longer than old string, cannot replace: " + oldValue);
+                                }
+                            }
+                        }
+                    }
+                    break;
+                }
+                
+                pos += chunkSize;
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Replace string error: " + e.getMessage(), e);
+        }
+        
+        return new ReplaceResult(data, count);
+    }
+
+    /**
+     * 从 AXML 数据中读取字符串
+     */
+    private String readStringFromAxml(byte[] data, int pos, boolean isUtf8) {
+        try {
+            if (isUtf8) {
+                int charLen = data[pos] & 0xFF;
+                int byteLen;
+                int dataStart;
+                
+                if ((charLen & 0x80) != 0) {
+                    charLen = ((charLen & 0x7F) << 8) | (data[pos + 1] & 0xFF);
+                    byteLen = data[pos + 2] & 0xFF;
+                    if ((byteLen & 0x80) != 0) {
+                        byteLen = ((byteLen & 0x7F) << 8) | (data[pos + 3] & 0xFF);
+                        dataStart = pos + 4;
+                    } else {
+                        dataStart = pos + 3;
+                    }
+                } else {
+                    byteLen = data[pos + 1] & 0xFF;
+                    if ((byteLen & 0x80) != 0) {
+                        byteLen = ((byteLen & 0x7F) << 8) | (data[pos + 2] & 0xFF);
+                        dataStart = pos + 3;
+                    } else {
+                        dataStart = pos + 2;
+                    }
+                }
+                
+                if (dataStart + byteLen > data.length) {
+                    byteLen = data.length - dataStart;
+                }
+                if (byteLen <= 0) return "";
+                
+                return new String(data, dataStart, byteLen, java.nio.charset.StandardCharsets.UTF_8);
+            }
+        } catch (Exception e) {
+            return "";
+        }
+        return "";
+    }
+
+    /**
+     * 获取字符串数据开始位置
+     */
+    private int getStringDataStart(byte[] data, int pos, boolean isUtf8) {
+        if (isUtf8) {
+            int charLen = data[pos] & 0xFF;
+            if ((charLen & 0x80) != 0) {
+                int byteLen = data[pos + 2] & 0xFF;
+                if ((byteLen & 0x80) != 0) {
+                    return pos + 4;
+                } else {
+                    return pos + 3;
+                }
+            } else {
+                int byteLen = data[pos + 1] & 0xFF;
+                if ((byteLen & 0x80) != 0) {
+                    return pos + 3;
+                } else {
+                    return pos + 2;
+                }
+            }
+        }
+        return pos + 2;
+    }
+
+    /**
+     * 列出 APK 中的所有文件
+     */
+    public JSObject listApkFiles(String apkPath, String filter, int limit, int offset) throws Exception {
+        JSObject result = new JSObject();
+        JSArray files = new JSArray();
+        
+        java.util.zip.ZipFile zipFile = null;
+        try {
+            zipFile = new java.util.zip.ZipFile(apkPath);
+            java.util.Enumeration<? extends java.util.zip.ZipEntry> entries = zipFile.entries();
+            
+            java.util.List<JSObject> allFiles = new java.util.ArrayList<>();
+            
+            while (entries.hasMoreElements()) {
+                java.util.zip.ZipEntry entry = entries.nextElement();
+                String name = entry.getName();
+                
+                // 应用过滤
+                if (!filter.isEmpty() && !name.contains(filter)) {
+                    continue;
+                }
+                
+                JSObject fileInfo = new JSObject();
+                fileInfo.put("path", name);
+                fileInfo.put("size", entry.getSize());
+                fileInfo.put("compressedSize", entry.getCompressedSize());
+                fileInfo.put("isDirectory", entry.isDirectory());
+                
+                // 判断文件类型
+                String type = "unknown";
+                if (name.endsWith(".dex")) type = "dex";
+                else if (name.endsWith(".so")) type = "native";
+                else if (name.endsWith(".xml")) type = "xml";
+                else if (name.startsWith("res/")) type = "resource";
+                else if (name.startsWith("assets/")) type = "asset";
+                else if (name.startsWith("lib/")) type = "native";
+                else if (name.startsWith("META-INF/")) type = "meta";
+                else if (name.equals("AndroidManifest.xml")) type = "manifest";
+                else if (name.equals("resources.arsc")) type = "arsc";
+                fileInfo.put("type", type);
+                
+                allFiles.add(fileInfo);
+            }
+            
+            int total = allFiles.size();
+            
+            // 分页
+            int start = Math.min(offset, total);
+            int end = Math.min(offset + limit, total);
+            
+            for (int i = start; i < end; i++) {
+                files.put(allFiles.get(i));
+            }
+            
+            result.put("files", files);
+            result.put("total", total);
+            result.put("offset", offset);
+            result.put("limit", limit);
+            result.put("returned", files.length());
+            result.put("hasMore", end < total);
+            
+        } finally {
+            if (zipFile != null) {
+                try { zipFile.close(); } catch (Exception ignored) {}
+            }
+        }
+        
+        return result;
+    }
+
+    /**
+     * 读取 APK 中的任意文件
+     */
+    public JSObject readApkFile(String apkPath, String filePath, boolean asBase64, int maxBytes, int offset) throws Exception {
+        JSObject result = new JSObject();
+        
+        java.util.zip.ZipFile zipFile = null;
+        try {
+            zipFile = new java.util.zip.ZipFile(apkPath);
+            java.util.zip.ZipEntry entry = zipFile.getEntry(filePath);
+            
+            if (entry == null) {
+                result.put("error", "File not found: " + filePath);
+                return result;
+            }
+            
+            result.put("path", filePath);
+            result.put("size", entry.getSize());
+            result.put("compressedSize", entry.getCompressedSize());
+            
+            java.io.InputStream is = zipFile.getInputStream(entry);
+            
+            // 跳过偏移量
+            if (offset > 0) {
+                is.skip(offset);
+            }
+            
+            // 读取数据
+            int readSize = maxBytes > 0 ? maxBytes : (int) entry.getSize();
+            if (readSize > 1024 * 1024) { // 限制最大 1MB
+                readSize = 1024 * 1024;
+            }
+            
+            byte[] buffer = new byte[readSize];
+            int totalRead = 0;
+            int read;
+            while (totalRead < readSize && (read = is.read(buffer, totalRead, readSize - totalRead)) != -1) {
+                totalRead += read;
+            }
+            is.close();
+            
+            byte[] data = new byte[totalRead];
+            System.arraycopy(buffer, 0, data, 0, totalRead);
+            
+            if (asBase64) {
+                // Base64 编码返回
+                result.put("content", android.util.Base64.encodeToString(data, android.util.Base64.NO_WRAP));
+                result.put("encoding", "base64");
+            } else {
+                // 尝试作为文本返回
+                String content = new String(data, java.nio.charset.StandardCharsets.UTF_8);
+                
+                // 检查是否是二进制文件
+                boolean isBinary = false;
+                for (int i = 0; i < Math.min(100, data.length); i++) {
+                    if (data[i] == 0) {
+                        isBinary = true;
+                        break;
+                    }
+                }
+                
+                if (isBinary && !filePath.endsWith(".xml")) {
+                    // 二进制文件自动使用 Base64
+                    result.put("content", android.util.Base64.encodeToString(data, android.util.Base64.NO_WRAP));
+                    result.put("encoding", "base64");
+                    result.put("note", "Binary file, auto-encoded as base64");
+                } else {
+                    // 如果是 XML 文件，尝试解码 AXML
+                    if (filePath.endsWith(".xml") && data.length > 4) {
+                        int magic = (data[0] & 0xFF) | ((data[1] & 0xFF) << 8) | 
+                                   ((data[2] & 0xFF) << 16) | ((data[3] & 0xFF) << 24);
+                        if (magic == 0x00080003) {
+                            // 是 AXML 格式，解码
+                            content = AxmlParser.decode(data);
+                        }
+                    }
+                    result.put("content", content);
+                    result.put("encoding", "text");
+                }
+            }
+            
+            result.put("offset", offset);
+            result.put("bytesRead", totalRead);
+            result.put("hasMore", offset + totalRead < entry.getSize());
+            
+        } finally {
+            if (zipFile != null) {
+                try { zipFile.close(); } catch (Exception ignored) {}
+            }
+        }
+        
+        return result;
+    }
+
+    /**
+     * 清理临时目录
+     */
+    private void cleanupTempDir(java.io.File dir) {
+        if (dir != null && dir.exists()) {
+            java.io.File[] files = dir.listFiles();
+            if (files != null) {
+                for (java.io.File file : files) {
+                    if (file.isDirectory()) {
+                        cleanupTempDir(file);
+                    } else {
+                        file.delete();
+                    }
+                }
+            }
+            dir.delete();
+        }
+    }
+}
