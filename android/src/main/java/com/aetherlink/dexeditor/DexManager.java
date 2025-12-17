@@ -150,6 +150,7 @@ public class DexManager {
         String sessionId;
         String apkPath;
         Map<String, DexBackedDexFile> dexFiles;
+        Map<String, byte[]> dexBytes;  // DEX 字节数据，用于 Rust 搜索
         Map<String, ClassDef> modifiedClasses;
         boolean modified = false;
 
@@ -157,11 +158,15 @@ public class DexManager {
             this.sessionId = sessionId;
             this.apkPath = apkPath;
             this.dexFiles = new HashMap<>();
+            this.dexBytes = new HashMap<>();
             this.modifiedClasses = new HashMap<>();
         }
 
-        void addDex(String dexName, DexBackedDexFile dexFile) {
+        void addDex(String dexName, DexBackedDexFile dexFile, byte[] bytes) {
             this.dexFiles.put(dexName, dexFile);
+            if (bytes != null) {
+                this.dexBytes.put(dexName, bytes);
+            }
         }
     }
 
@@ -1631,10 +1636,11 @@ public class DexManager {
                     baos.write(buffer, 0, len);
                 }
                 is.close();
+                byte[] dexData = baos.toByteArray();
                 
                 // 解析 DEX
-                DexBackedDexFile dexFile = new DexBackedDexFile(Opcodes.getDefault(), baos.toByteArray());
-                multiSession.addDex(dexName, dexFile);
+                DexBackedDexFile dexFile = new DexBackedDexFile(Opcodes.getDefault(), dexData);
+                multiSession.addDex(dexName, dexFile, dexData);
                 totalClasses += dexFile.getClasses().size();
                 
                 Log.d(TAG, "Loaded DEX: " + dexName + " with " + dexFile.getClasses().size() + " classes");
@@ -1695,7 +1701,7 @@ public class DexManager {
     }
 
     /**
-     * 获取多 DEX 会话中的类列表（支持分页和过滤）
+     * 获取多 DEX 会话中的类列表（Rust 实现）
      */
     public JSObject getClassesFromMultiSession(String sessionId, String packageFilter, int offset, int limit) throws Exception {
         MultiDexSession session = multiDexSessions.get(sessionId);
@@ -1703,26 +1709,29 @@ public class DexManager {
             throw new IllegalArgumentException("Session not found: " + sessionId);
         }
         
+        if (!RustDex.isAvailable() || session.dexBytes.isEmpty()) {
+            throw new RuntimeException("Rust DEX library not available");
+        }
+        
         JSObject result = new JSObject();
         JSArray classes = new JSArray();
         List<String> allClasses = new ArrayList<>();
+        String filter = packageFilter != null ? packageFilter : "";
         
-        // 收集所有类
-        for (Map.Entry<String, DexBackedDexFile> entry : session.dexFiles.entrySet()) {
+        // 使用 Rust 获取每个 DEX 的类列表
+        for (Map.Entry<String, byte[]> entry : session.dexBytes.entrySet()) {
             String dexName = entry.getKey();
-            DexBackedDexFile dexFile = entry.getValue();
+            byte[] dexData = entry.getValue();
             
-            for (ClassDef classDef : dexFile.getClasses()) {
-                String className = convertTypeToClassName(classDef.getType());
-                
-                // 包名过滤
-                if (packageFilter != null && !packageFilter.isEmpty()) {
-                    if (!className.startsWith(packageFilter)) {
-                        continue;
+            String jsonResult = RustDex.listClasses(dexData, filter, 0, 100000);
+            if (jsonResult != null && !jsonResult.contains("\"error\"")) {
+                org.json.JSONObject rustResult = new org.json.JSONObject(jsonResult);
+                org.json.JSONArray rustClasses = rustResult.optJSONArray("classes");
+                if (rustClasses != null) {
+                    for (int i = 0; i < rustClasses.length(); i++) {
+                        allClasses.add(rustClasses.getString(i) + "|" + dexName);
                     }
                 }
-                
-                allClasses.add(className + "|" + dexName);
             }
         }
         
@@ -1746,12 +1755,13 @@ public class DexManager {
         result.put("limit", limit);
         result.put("classes", classes);
         result.put("hasMore", end < total);
+        result.put("engine", "rust");
         
         return result;
     }
 
     /**
-     * 在多 DEX 会话中搜索
+     * 在多 DEX 会话中搜索（Rust 实现）
      */
     public JSObject searchInMultiSession(String sessionId, String query, String searchType, 
                                           boolean caseSensitive, int maxResults) throws Exception {
@@ -1760,118 +1770,53 @@ public class DexManager {
             throw new IllegalArgumentException("Session not found: " + sessionId);
         }
         
-        JSObject result = new JSObject();
-        JSArray results = new JSArray();
-        String queryMatch = caseSensitive ? query : query.toLowerCase();
+        if (!RustDex.isAvailable()) {
+            throw new RuntimeException("Rust DEX library not available");
+        }
         
-        outerLoop:
-        for (Map.Entry<String, DexBackedDexFile> entry : session.dexFiles.entrySet()) {
+        if (session.dexBytes.isEmpty()) {
+            throw new RuntimeException("No DEX data loaded");
+        }
+        
+        JSObject result = new JSObject();
+        JSArray allResults = new JSArray();
+        
+        for (Map.Entry<String, byte[]> entry : session.dexBytes.entrySet()) {
             String dexName = entry.getKey();
-            DexBackedDexFile dexFile = entry.getValue();
+            byte[] dexData = entry.getValue();
             
-            for (ClassDef classDef : dexFile.getClasses()) {
-                if (results.length() >= maxResults) break outerLoop;
+            String jsonResult = RustDex.searchInDex(dexData, query, searchType, caseSensitive, maxResults);
+            
+            if (jsonResult != null && !jsonResult.contains("\"error\"")) {
+                org.json.JSONObject rustResult = new org.json.JSONObject(jsonResult);
+                org.json.JSONArray rustResults = rustResult.optJSONArray("results");
                 
-                String className = convertTypeToClassName(classDef.getType());
-                String classNameMatch = caseSensitive ? className : className.toLowerCase();
-                
-                switch (searchType) {
-                    case "class":
-                        if (classNameMatch.contains(queryMatch)) {
-                            JSObject item = new JSObject();
-                            item.put("type", "class");
-                            item.put("className", className);
-                            item.put("dexFile", dexName);
-                            results.put(item);
+                if (rustResults != null) {
+                    for (int i = 0; i < rustResults.length() && allResults.length() < maxResults; i++) {
+                        org.json.JSONObject item = rustResults.getJSONObject(i);
+                        JSObject jsItem = new JSObject();
+                        jsItem.put("type", item.optString("type", searchType));
+                        jsItem.put("className", item.optString("className", ""));
+                        jsItem.put("dexFile", dexName);
+                        if (item.has("methodName")) {
+                            jsItem.put("methodName", item.getString("methodName"));
                         }
-                        break;
-                        
-                    case "package":
-                        if (classNameMatch.startsWith(queryMatch)) {
-                            JSObject item = new JSObject();
-                            item.put("type", "package");
-                            item.put("className", className);
-                            item.put("dexFile", dexName);
-                            results.put(item);
+                        if (item.has("fieldName")) {
+                            jsItem.put("fieldName", item.getString("fieldName"));
                         }
-                        break;
-                        
-                    case "method":
-                        for (Method method : classDef.getMethods()) {
-                            if (results.length() >= maxResults) break outerLoop;
-                            String methodName = method.getName();
-                            String methodMatch = caseSensitive ? methodName : methodName.toLowerCase();
-                            if (methodMatch.contains(queryMatch)) {
-                                JSObject item = new JSObject();
-                                item.put("type", "method");
-                                item.put("className", className);
-                                item.put("methodName", methodName);
-                                item.put("dexFile", dexName);
-                                results.put(item);
-                            }
-                        }
-                        break;
-                        
-                    case "field":
-                        for (Field field : classDef.getFields()) {
-                            if (results.length() >= maxResults) break outerLoop;
-                            String fieldName = field.getName();
-                            String fieldMatch = caseSensitive ? fieldName : fieldName.toLowerCase();
-                            if (fieldMatch.contains(queryMatch)) {
-                                JSObject item = new JSObject();
-                                item.put("type", "field");
-                                item.put("className", className);
-                                item.put("fieldName", fieldName);
-                                item.put("dexFile", dexName);
-                                results.put(item);
-                            }
-                        }
-                        break;
-                        
-                    case "string":
-                    case "code":
-                        // 需要反编译 smali 搜索
-                        String smali = getSmaliForClass(dexFile, classDef);
-                        String smaliMatch = caseSensitive ? smali : smali.toLowerCase();
-                        if (smaliMatch.contains(queryMatch)) {
-                            JSObject item = new JSObject();
-                            item.put("type", searchType);
-                            item.put("className", className);
-                            item.put("dexFile", dexName);
-                            // 找到匹配的行
-                            String[] lines = smali.split("\n");
-                            for (int i = 0; i < lines.length; i++) {
-                                String lineMatch = caseSensitive ? lines[i] : lines[i].toLowerCase();
-                                if (lineMatch.contains(queryMatch)) {
-                                    item.put("line", i + 1);
-                                    item.put("content", lines[i].trim());
-                                    break;
-                                }
-                            }
-                            results.put(item);
-                        }
-                        break;
-                        
-                    case "int":
-                        // 搜索整数常量
-                        String smaliForInt = getSmaliForClass(dexFile, classDef);
-                        if (smaliForInt.contains("0x" + query) || smaliForInt.contains(" " + query + "\n") || 
-                            smaliForInt.contains(" " + query + " ")) {
-                            JSObject item = new JSObject();
-                            item.put("type", "int");
-                            item.put("className", className);
-                            item.put("dexFile", dexName);
-                            results.put(item);
-                        }
-                        break;
+                        allResults.put(jsItem);
+                    }
                 }
             }
+            
+            if (allResults.length() >= maxResults) break;
         }
         
         result.put("query", query);
         result.put("searchType", searchType);
-        result.put("total", results.length());
-        result.put("results", results);
+        result.put("total", allResults.length());
+        result.put("results", allResults);
+        result.put("engine", "rust");
         
         return result;
     }
@@ -1893,8 +1838,9 @@ public class DexManager {
         }
     }
 
+
     /**
-     * 从多 DEX 会话获取类的 Smali 代码
+     * 从多 DEX 会话获取类的 Smali 代码（Rust 实现）
      */
     public JSObject getClassSmaliFromSession(String sessionId, String className) throws Exception {
         MultiDexSession session = multiDexSessions.get(sessionId);
@@ -1902,20 +1848,24 @@ public class DexManager {
             throw new IllegalArgumentException("Session not found: " + sessionId);
         }
         
-        String targetType = convertClassNameToType(className);
+        if (!RustDex.isAvailable()) {
+            throw new RuntimeException("Rust DEX library not available");
+        }
         
-        for (Map.Entry<String, DexBackedDexFile> entry : session.dexFiles.entrySet()) {
+        // 使用 Rust 获取 Smali
+        for (Map.Entry<String, byte[]> entry : session.dexBytes.entrySet()) {
             String dexName = entry.getKey();
-            DexBackedDexFile dexFile = entry.getValue();
+            byte[] dexData = entry.getValue();
             
-            for (ClassDef classDef : dexFile.getClasses()) {
-                if (classDef.getType().equals(targetType)) {
-                    JSObject result = new JSObject();
-                    result.put("className", className);
-                    result.put("dexFile", dexName);
-                    result.put("smaliContent", getSmaliForClass(dexFile, classDef));
-                    return result;
-                }
+            String jsonResult = RustDex.getClassSmali(dexData, className);
+            if (jsonResult != null && !jsonResult.contains("\"error\"")) {
+                org.json.JSONObject rustResult = new org.json.JSONObject(jsonResult);
+                JSObject result = new JSObject();
+                result.put("className", className);
+                result.put("dexFile", dexName);
+                result.put("smaliContent", rustResult.optString("smaliContent", ""));
+                result.put("engine", "rust");
+                return result;
             }
         }
         
@@ -1923,7 +1873,7 @@ public class DexManager {
     }
 
     /**
-     * 修改类并保存到多 DEX 会话
+     * 修改类并保存到多 DEX 会话（Rust 实现）
      */
     public void modifyClassInSession(String sessionId, String className, String smaliContent) throws Exception {
         MultiDexSession session = multiDexSessions.get(sessionId);
@@ -1931,36 +1881,41 @@ public class DexManager {
             throw new IllegalArgumentException("Session not found: " + sessionId);
         }
         
-        String targetType = convertClassNameToType(className);
+        if (!RustDex.isAvailable()) {
+            throw new RuntimeException("Rust DEX library not available");
+        }
         
         // 找到类所在的 DEX
         String targetDex = null;
-        for (Map.Entry<String, DexBackedDexFile> entry : session.dexFiles.entrySet()) {
-            for (ClassDef classDef : entry.getValue().getClasses()) {
-                if (classDef.getType().equals(targetType)) {
-                    targetDex = entry.getKey();
-                    break;
-                }
+        for (Map.Entry<String, byte[]> entry : session.dexBytes.entrySet()) {
+            String jsonResult = RustDex.getClassSmali(entry.getValue(), className);
+            if (jsonResult != null && !jsonResult.contains("\"error\"")) {
+                targetDex = entry.getKey();
+                break;
             }
-            if (targetDex != null) break;
         }
         
         if (targetDex == null) {
             throw new IllegalArgumentException("Class not found: " + className);
         }
         
-        // 编译新的 Smali
-        ClassDef newClassDef = compileSmaliToClass(smaliContent, Opcodes.getDefault());
+        // 使用 Rust 修改类
+        byte[] originalDex = session.dexBytes.get(targetDex);
+        byte[] modifiedDex = RustDex.modifyClass(originalDex, className, smaliContent);
         
-        // 记录修改
-        session.modifiedClasses.put(targetDex + "|" + className, newClassDef);
+        if (modifiedDex == null) {
+            throw new RuntimeException("Failed to modify class: " + className);
+        }
+        
+        // 更新 DEX 字节数据
+        session.dexBytes.put(targetDex, modifiedDex);
         session.modified = true;
         
-        Log.d(TAG, "Modified class in session: " + className);
+        Log.d(TAG, "Modified class in session (Rust): " + className);
     }
 
     /**
-     * 添加新类到会话
+     * 添加新类到会话（Rust 实现）
      */
     public void addClassToSession(String sessionId, String className, String smaliContent) throws Exception {
         MultiDexSession session = multiDexSessions.get(sessionId);
@@ -1968,23 +1923,33 @@ public class DexManager {
             throw new IllegalArgumentException("Session not found: " + sessionId);
         }
         
-        // 编译 Smali
-        ClassDef newClassDef = compileSmaliToClass(smaliContent, Opcodes.getDefault());
+        if (!RustDex.isAvailable()) {
+            throw new RuntimeException("Rust DEX library not available");
+        }
         
         // 添加到第一个 DEX（默认 classes.dex）
         String targetDex = "classes.dex";
-        if (!session.dexFiles.containsKey(targetDex) && !session.dexFiles.isEmpty()) {
-            targetDex = session.dexFiles.keySet().iterator().next();
+        if (!session.dexBytes.containsKey(targetDex) && !session.dexBytes.isEmpty()) {
+            targetDex = session.dexBytes.keySet().iterator().next();
         }
         
-        session.modifiedClasses.put(targetDex + "|" + className, newClassDef);
+        // 使用 Rust 添加类
+        byte[] originalDex = session.dexBytes.get(targetDex);
+        byte[] modifiedDex = RustDex.addClass(originalDex, smaliContent);
+        
+        if (modifiedDex == null) {
+            throw new RuntimeException("Failed to add class: " + className);
+        }
+        
+        // 更新 DEX 字节数据
+        session.dexBytes.put(targetDex, modifiedDex);
         session.modified = true;
         
-        Log.d(TAG, "Added class to session: " + className);
+        Log.d(TAG, "Added class to session (Rust): " + className);
     }
 
     /**
-     * 从会话中删除类
+     * 从会话中删除类（Rust 实现）
      */
     public void deleteClassFromSession(String sessionId, String className) throws Exception {
         MultiDexSession session = multiDexSessions.get(sessionId);
@@ -1992,29 +1957,37 @@ public class DexManager {
             throw new IllegalArgumentException("Session not found: " + sessionId);
         }
         
-        String targetType = convertClassNameToType(className);
+        if (!RustDex.isAvailable()) {
+            throw new RuntimeException("Rust DEX library not available");
+        }
         
-        // 找到类所在的 DEX 并标记为删除
+        // 找到类所在的 DEX
         String targetDex = null;
-        for (Map.Entry<String, DexBackedDexFile> entry : session.dexFiles.entrySet()) {
-            for (ClassDef classDef : entry.getValue().getClasses()) {
-                if (classDef.getType().equals(targetType)) {
-                    targetDex = entry.getKey();
-                    break;
-                }
+        for (Map.Entry<String, byte[]> entry : session.dexBytes.entrySet()) {
+            String jsonResult = RustDex.getClassSmali(entry.getValue(), className);
+            if (jsonResult != null && !jsonResult.contains("\"error\"")) {
+                targetDex = entry.getKey();
+                break;
             }
-            if (targetDex != null) break;
         }
         
         if (targetDex == null) {
             throw new IllegalArgumentException("Class not found: " + className);
         }
         
-        // 用 null 标记删除
-        session.modifiedClasses.put(targetDex + "|" + className, null);
+        // 使用 Rust 删除类
+        byte[] originalDex = session.dexBytes.get(targetDex);
+        byte[] modifiedDex = RustDex.deleteClass(originalDex, className);
+        
+        if (modifiedDex == null) {
+            throw new RuntimeException("Failed to delete class: " + className);
+        }
+        
+        // 更新 DEX 字节数据
+        session.dexBytes.put(targetDex, modifiedDex);
         session.modified = true;
         
-        Log.d(TAG, "Deleted class from session: " + className);
+        Log.d(TAG, "Deleted class from session (Rust): " + className);
     }
 
     /**
@@ -3699,6 +3672,136 @@ public class DexManager {
                 try { zipFile.close(); } catch (Exception ignored) {}
             }
         }
+        
+        return result;
+    }
+
+    /**
+     * 在 APK 中搜索文本内容
+     */
+    public JSObject searchTextInApk(String apkPath, String pattern, org.json.JSONArray fileExtensions, 
+                                     boolean caseSensitive, boolean isRegex, int maxResults, int contextLines) throws Exception {
+        JSObject result = new JSObject();
+        JSArray results = new JSArray();
+        
+        // 二进制文件扩展名（跳过）
+        java.util.Set<String> binaryExtensions = new java.util.HashSet<>(java.util.Arrays.asList(
+            ".dex", ".so", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico",
+            ".zip", ".apk", ".jar", ".class", ".ogg", ".mp3", ".wav", ".mp4",
+            ".arsc", ".9.png", ".ttf", ".otf", ".woff"
+        ));
+        
+        // 解析文件扩展名过滤
+        java.util.Set<String> allowedExtensions = new java.util.HashSet<>();
+        if (fileExtensions != null && fileExtensions.length() > 0) {
+            for (int i = 0; i < fileExtensions.length(); i++) {
+                String ext = fileExtensions.getString(i);
+                if (!ext.startsWith(".")) ext = "." + ext;
+                allowedExtensions.add(ext.toLowerCase());
+            }
+        }
+        
+        // 编译搜索模式
+        java.util.regex.Pattern regex;
+        int flags = caseSensitive ? 0 : java.util.regex.Pattern.CASE_INSENSITIVE;
+        if (isRegex) {
+            regex = java.util.regex.Pattern.compile(pattern, flags);
+        } else {
+            regex = java.util.regex.Pattern.compile(java.util.regex.Pattern.quote(pattern), flags);
+        }
+        
+        int totalFound = 0;
+        int filesSearched = 0;
+        boolean truncated = false;
+        
+        java.util.zip.ZipFile zipFile = null;
+        try {
+            zipFile = new java.util.zip.ZipFile(apkPath);
+            java.util.Enumeration<? extends java.util.zip.ZipEntry> entries = zipFile.entries();
+            
+            while (entries.hasMoreElements() && totalFound < maxResults) {
+                java.util.zip.ZipEntry entry = entries.nextElement();
+                if (entry.isDirectory()) continue;
+                
+                String name = entry.getName();
+                String ext = "";
+                int dotIndex = name.lastIndexOf('.');
+                if (dotIndex > 0) {
+                    ext = name.substring(dotIndex).toLowerCase();
+                }
+                
+                // 跳过二进制文件
+                if (binaryExtensions.contains(ext)) continue;
+                
+                // 检查扩展名过滤
+                if (!allowedExtensions.isEmpty() && !allowedExtensions.contains(ext)) continue;
+                
+                // 跳过大文件（> 1MB）
+                if (entry.getSize() > 1024 * 1024) continue;
+                
+                try {
+                    java.io.InputStream is = zipFile.getInputStream(entry);
+                    byte[] data = new byte[(int) entry.getSize()];
+                    int totalRead = 0;
+                    int read;
+                    while (totalRead < data.length && (read = is.read(data, totalRead, data.length - totalRead)) != -1) {
+                        totalRead += read;
+                    }
+                    is.close();
+                    
+                    // 检查是否是二进制
+                    boolean isBinary = false;
+                    for (int i = 0; i < Math.min(100, data.length); i++) {
+                        if (data[i] == 0) {
+                            isBinary = true;
+                            break;
+                        }
+                    }
+                    if (isBinary) continue;
+                    
+                    String content = new String(data, java.nio.charset.StandardCharsets.UTF_8);
+                    String[] lines = content.split("\n");
+                    
+                    filesSearched++;
+                    
+                    for (int i = 0; i < lines.length && totalFound < maxResults; i++) {
+                        java.util.regex.Matcher matcher = regex.matcher(lines[i]);
+                        if (matcher.find()) {
+                            JSObject match = new JSObject();
+                            match.put("file", name);
+                            match.put("lineNumber", i + 1);
+                            match.put("line", lines[i].trim());
+                            
+                            // 添加上下文
+                            JSArray context = new JSArray();
+                            int start = Math.max(0, i - contextLines);
+                            int end = Math.min(lines.length, i + contextLines + 1);
+                            for (int j = start; j < end; j++) {
+                                context.put(lines[j]);
+                            }
+                            match.put("context", context);
+                            
+                            results.put(match);
+                            totalFound++;
+                        }
+                    }
+                } catch (Exception e) {
+                    // 跳过无法读取的文件
+                }
+            }
+            
+            truncated = totalFound >= maxResults;
+            
+        } finally {
+            if (zipFile != null) {
+                try { zipFile.close(); } catch (Exception ignored) {}
+            }
+        }
+        
+        result.put("results", results);
+        result.put("totalFound", totalFound);
+        result.put("filesSearched", filesSearched);
+        result.put("truncated", truncated);
         
         return result;
     }

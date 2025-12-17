@@ -665,6 +665,18 @@ public class DexEditorPluginPlugin extends Plugin {
                 ));
                 break;
 
+            case "searchTextInApk":
+                result.put("data", dexManager.searchTextInApk(
+                    params.getString("apkPath"),
+                    params.getString("pattern"),
+                    params.optJSONArray("fileExtensions"),
+                    params.optBoolean("caseSensitive", false),
+                    params.optBoolean("isRegex", false),
+                    params.optInt("maxResults", 50),
+                    params.optInt("contextLines", 2)
+                ));
+                break;
+
             case "readApkFile":
                 result.put("data", dexManager.readApkFile(
                     params.getString("apkPath"),
