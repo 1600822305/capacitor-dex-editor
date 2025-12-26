@@ -1,0 +1,27 @@
+{
+  "buildFiles": [
+    "K:\\Cherry\\capacitor-dex-editor\\android\\src\\main\\cpp\\CMakeLists.txt"
+  ],
+  "cleanCommandsComponents": [
+    [
+      "K:\\studiosdk\\cmake\\3.22.1\\bin\\ninja.exe",
+      "-C",
+      "K:\\Cherry\\capacitor-dex-editor\\android\\.cxx\\Debug\\1d7e4x2y\\arm64-v8a",
+      "clean"
+    ]
+  ],
+  "buildTargetsCommandComponents": [
+    "K:\\studiosdk\\cmake\\3.22.1\\bin\\ninja.exe",
+    "-C",
+    "K:\\Cherry\\capacitor-dex-editor\\android\\.cxx\\Debug\\1d7e4x2y\\arm64-v8a",
+    "{LIST_OF_TARGETS_TO_BUILD}"
+  ],
+  "libraries": {
+    "dex_cpp::@6890427a1f51a3e7e1df": {
+      "artifactName": "dex_cpp",
+      "abi": "arm64-v8a",
+      "output": "K:\\Cherry\\capacitor-dex-editor\\android\\build\\intermediates\\cxx\\Debug\\1d7e4x2y\\obj\\arm64-v8a\\libdex_cpp.so",
+      "runtimeFiles": []
+    }
+  }
+}

@@ -1709,8 +1709,8 @@ public class DexManager {
             throw new IllegalArgumentException("Session not found: " + sessionId);
         }
         
-        if (!RustDex.isAvailable() || session.dexBytes.isEmpty()) {
-            throw new RuntimeException("Rust DEX library not available");
+        if (!CppDex.isAvailable() || session.dexBytes.isEmpty()) {
+            throw new RuntimeException("C++ DEX library not available");
         }
         
         JSObject result = new JSObject();
@@ -1723,7 +1723,7 @@ public class DexManager {
             String dexName = entry.getKey();
             byte[] dexData = entry.getValue();
             
-            String jsonResult = RustDex.listClasses(dexData, filter, 0, 100000);
+            String jsonResult = CppDex.listClasses(dexData, filter, 0, 100000);
             if (jsonResult != null && !jsonResult.contains("\"error\"")) {
                 org.json.JSONObject rustResult = new org.json.JSONObject(jsonResult);
                 org.json.JSONArray rustClasses = rustResult.optJSONArray("classes");
@@ -1770,8 +1770,8 @@ public class DexManager {
             throw new IllegalArgumentException("Session not found: " + sessionId);
         }
         
-        if (!RustDex.isAvailable()) {
-            throw new RuntimeException("Rust DEX library not available");
+        if (!CppDex.isAvailable()) {
+            throw new RuntimeException("C++ DEX library not available");
         }
         
         if (session.dexBytes.isEmpty()) {
@@ -1785,7 +1785,7 @@ public class DexManager {
             String dexName = entry.getKey();
             byte[] dexData = entry.getValue();
             
-            String jsonResult = RustDex.searchInDex(dexData, query, searchType, caseSensitive, maxResults);
+            String jsonResult = CppDex.searchInDex(dexData, query, searchType, caseSensitive, maxResults);
             
             if (jsonResult != null && !jsonResult.contains("\"error\"")) {
                 org.json.JSONObject rustResult = new org.json.JSONObject(jsonResult);
@@ -1848,8 +1848,8 @@ public class DexManager {
             throw new IllegalArgumentException("Session not found: " + sessionId);
         }
         
-        if (!RustDex.isAvailable()) {
-            throw new RuntimeException("Rust DEX library not available");
+        if (!CppDex.isAvailable()) {
+            throw new RuntimeException("C++ DEX library not available");
         }
         
         // 使用 Rust 获取 Smali
@@ -1857,7 +1857,7 @@ public class DexManager {
             String dexName = entry.getKey();
             byte[] dexData = entry.getValue();
             
-            String jsonResult = RustDex.getClassSmali(dexData, className);
+            String jsonResult = CppDex.getClassSmali(dexData, className);
             if (jsonResult != null && !jsonResult.contains("\"error\"")) {
                 org.json.JSONObject rustResult = new org.json.JSONObject(jsonResult);
                 JSObject result = new JSObject();
@@ -1881,14 +1881,14 @@ public class DexManager {
             throw new IllegalArgumentException("Session not found: " + sessionId);
         }
         
-        if (!RustDex.isAvailable()) {
-            throw new RuntimeException("Rust DEX library not available");
+        if (!CppDex.isAvailable()) {
+            throw new RuntimeException("C++ DEX library not available");
         }
         
         // 找到类所在的 DEX
         String targetDex = null;
         for (Map.Entry<String, byte[]> entry : session.dexBytes.entrySet()) {
-            String jsonResult = RustDex.getClassSmali(entry.getValue(), className);
+            String jsonResult = CppDex.getClassSmali(entry.getValue(), className);
             if (jsonResult != null && !jsonResult.contains("\"error\"")) {
                 targetDex = entry.getKey();
                 break;
@@ -1901,7 +1901,7 @@ public class DexManager {
         
         // 使用 Rust 修改类
         byte[] originalDex = session.dexBytes.get(targetDex);
-        byte[] modifiedDex = RustDex.modifyClass(originalDex, className, smaliContent);
+        byte[] modifiedDex = CppDex.modifyClass(originalDex, className, smaliContent);
         
         if (modifiedDex == null) {
             throw new RuntimeException("Failed to modify class: " + className);
@@ -1923,8 +1923,8 @@ public class DexManager {
             throw new IllegalArgumentException("Session not found: " + sessionId);
         }
         
-        if (!RustDex.isAvailable()) {
-            throw new RuntimeException("Rust DEX library not available");
+        if (!CppDex.isAvailable()) {
+            throw new RuntimeException("C++ DEX library not available");
         }
         
         // 添加到第一个 DEX（默认 classes.dex）
@@ -1935,7 +1935,7 @@ public class DexManager {
         
         // 使用 Rust 添加类
         byte[] originalDex = session.dexBytes.get(targetDex);
-        byte[] modifiedDex = RustDex.addClass(originalDex, smaliContent);
+        byte[] modifiedDex = CppDex.addClass(originalDex, smaliContent);
         
         if (modifiedDex == null) {
             throw new RuntimeException("Failed to add class: " + className);
@@ -1957,14 +1957,14 @@ public class DexManager {
             throw new IllegalArgumentException("Session not found: " + sessionId);
         }
         
-        if (!RustDex.isAvailable()) {
-            throw new RuntimeException("Rust DEX library not available");
+        if (!CppDex.isAvailable()) {
+            throw new RuntimeException("C++ DEX library not available");
         }
         
         // 找到类所在的 DEX
         String targetDex = null;
         for (Map.Entry<String, byte[]> entry : session.dexBytes.entrySet()) {
-            String jsonResult = RustDex.getClassSmali(entry.getValue(), className);
+            String jsonResult = CppDex.getClassSmali(entry.getValue(), className);
             if (jsonResult != null && !jsonResult.contains("\"error\"")) {
                 targetDex = entry.getKey();
                 break;
@@ -1977,7 +1977,7 @@ public class DexManager {
         
         // 使用 Rust 删除类
         byte[] originalDex = session.dexBytes.get(targetDex);
-        byte[] modifiedDex = RustDex.deleteClass(originalDex, className);
+        byte[] modifiedDex = CppDex.deleteClass(originalDex, className);
         
         if (modifiedDex == null) {
             throw new RuntimeException("Failed to delete class: " + className);

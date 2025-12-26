@@ -1,0 +1,3 @@
+K:/Cherry/capacitor-dex-editor/android/.cxx/Debug/1d7e4x2y/armeabi-v7a/CMakeFiles/dex_cpp.dir
+K:/Cherry/capacitor-dex-editor/android/.cxx/Debug/1d7e4x2y/armeabi-v7a/CMakeFiles/edit_cache.dir
+K:/Cherry/capacitor-dex-editor/android/.cxx/Debug/1d7e4x2y/armeabi-v7a/CMakeFiles/rebuild_cache.dir
