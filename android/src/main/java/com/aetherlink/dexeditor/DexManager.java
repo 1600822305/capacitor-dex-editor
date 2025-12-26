@@ -130,14 +130,16 @@ public class DexManager {
         String sessionId;
         String filePath;
         DexBackedDexFile originalDexFile;
+        byte[] dexBytes;  // DEX 字节数据，用于 C++ 解析
         List<ClassDef> modifiedClasses;
         Set<String> removedClasses;
         boolean modified = false;
 
-        DexSession(String sessionId, String filePath, DexBackedDexFile dexFile) {
+        DexSession(String sessionId, String filePath, DexBackedDexFile dexFile, byte[] bytes) {
             this.sessionId = sessionId;
             this.filePath = filePath;
             this.originalDexFile = dexFile;
+            this.dexBytes = bytes;
             this.modifiedClasses = new ArrayList<>();
             this.removedClasses = new HashSet<>();
         }
@@ -188,6 +190,9 @@ public class DexManager {
         // 生成或使用提供的 sessionId
         String sid = (sessionId != null && !sessionId.isEmpty()) ? sessionId : UUID.randomUUID().toString();
 
+        // 读取 DEX 字节数据（用于 C++ 解析）
+        byte[] dexBytes = readFileBytes(file);
+
         // 加载 DEX 文件 (使用官方推荐的 DexFileFactory)
         DexBackedDexFile dexFile = (DexBackedDexFile) DexFileFactory.loadDexFile(
             file, 
@@ -195,7 +200,7 @@ public class DexManager {
         );
 
         // 创建会话
-        DexSession session = new DexSession(sid, path, dexFile);
+        DexSession session = new DexSession(sid, path, dexFile, dexBytes);
         sessions.put(sid, session);
 
         Log.d(TAG, "Loaded DEX: " + path + " with session: " + sid);
@@ -262,18 +267,41 @@ public class DexManager {
     }
 
     /**
-     * 获取 DEX 文件信息
+     * 获取 DEX 文件信息（优先使用 C++ 实现）
      */
     public JSObject getDexInfo(String sessionId) throws Exception {
         DexSession session = getSession(sessionId);
+        
+        // 优先使用 C++ 实现
+        if (CppDex.isAvailable() && session.dexBytes != null) {
+            try {
+                String jsonResult = CppDex.getDexInfo(session.dexBytes);
+                if (jsonResult != null && !jsonResult.contains("\"error\"")) {
+                    org.json.JSONObject cppResult = new org.json.JSONObject(jsonResult);
+                    JSObject info = new JSObject();
+                    info.put("sessionId", sessionId);
+                    info.put("filePath", session.filePath);
+                    info.put("classCount", cppResult.optInt("classCount", 0));
+                    info.put("methodCount", cppResult.optInt("methodCount", 0));
+                    info.put("fieldCount", cppResult.optInt("fieldCount", 0));
+                    info.put("stringCount", cppResult.optInt("stringCount", 0));
+                    info.put("dexVersion", cppResult.optInt("version", 35));
+                    info.put("modified", session.modified);
+                    info.put("engine", "cpp");
+                    return info;
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "C++ getDexInfo failed, fallback to Java", e);
+            }
+        }
+        
+        // Java 回退实现
         DexBackedDexFile dexFile = session.originalDexFile;
-
         JSObject info = new JSObject();
         info.put("sessionId", sessionId);
         info.put("filePath", session.filePath);
         info.put("classCount", dexFile.getClasses().size());
         
-        // 统计方法和字段数量
         int methodCount = 0;
         int fieldCount = 0;
         for (ClassDef classDef : dexFile.getClasses()) {
@@ -284,18 +312,45 @@ public class DexManager {
         info.put("fieldCount", fieldCount);
         info.put("dexVersion", dexFile.getOpcodes().api);
         info.put("modified", session.modified);
+        info.put("engine", "java");
         return info;
     }
 
     // ==================== 类操作 ====================
 
     /**
-     * 获取所有类列表
+     * 获取所有类列表（优先使用 C++ 实现）
      */
     public JSArray getClasses(String sessionId) throws Exception {
         DexSession session = getSession(sessionId);
+        
+        // 优先使用 C++ 实现
+        if (CppDex.isAvailable() && session.dexBytes != null) {
+            try {
+                String jsonResult = CppDex.listClasses(session.dexBytes, "", 0, 100000);
+                if (jsonResult != null && !jsonResult.contains("\"error\"")) {
+                    org.json.JSONObject cppResult = new org.json.JSONObject(jsonResult);
+                    org.json.JSONArray cppClasses = cppResult.optJSONArray("classes");
+                    if (cppClasses != null) {
+                        JSArray classes = new JSArray();
+                        for (int i = 0; i < cppClasses.length(); i++) {
+                            String className = cppClasses.getString(i);
+                            if (!session.removedClasses.contains(className)) {
+                                JSObject classInfo = new JSObject();
+                                classInfo.put("type", className);
+                                classes.put(classInfo);
+                            }
+                        }
+                        return classes;
+                    }
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "C++ getClasses failed, fallback to Java", e);
+            }
+        }
+        
+        // Java 回退实现
         JSArray classes = new JSArray();
-
         for (ClassDef classDef : session.originalDexFile.getClasses()) {
             if (!session.removedClasses.contains(classDef.getType())) {
                 JSObject classInfo = new JSObject();
@@ -305,7 +360,6 @@ public class DexManager {
                 classes.put(classInfo);
             }
         }
-
         return classes;
     }
 
@@ -407,12 +461,38 @@ public class DexManager {
     // ==================== 方法操作 ====================
 
     /**
-     * 获取类的所有方法
+     * 获取类的所有方法（优先使用 C++ 实现）
      */
     public JSArray getMethods(String sessionId, String className) throws Exception {
         DexSession session = getSession(sessionId);
+        
+        // 优先使用 C++ 实现
+        if (CppDex.isAvailable() && session.dexBytes != null) {
+            try {
+                String jsonResult = CppDex.listMethods(session.dexBytes, className);
+                if (jsonResult != null && !jsonResult.contains("\"error\"")) {
+                    org.json.JSONObject cppResult = new org.json.JSONObject(jsonResult);
+                    org.json.JSONArray cppMethods = cppResult.optJSONArray("methods");
+                    if (cppMethods != null) {
+                        JSArray methods = new JSArray();
+                        for (int i = 0; i < cppMethods.length(); i++) {
+                            org.json.JSONObject m = cppMethods.getJSONObject(i);
+                            JSObject methodInfo = new JSObject();
+                            methodInfo.put("name", m.optString("name"));
+                            methodInfo.put("signature", m.optString("prototype"));
+                            methodInfo.put("accessFlags", m.optInt("accessFlags"));
+                            methods.put(methodInfo);
+                        }
+                        return methods;
+                    }
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "C++ getMethods failed, fallback to Java", e);
+            }
+        }
+        
+        // Java 回退实现
         ClassDef classDef = findClass(session, className);
-
         if (classDef == null) {
             throw new IllegalArgumentException("Class not found: " + className);
         }
@@ -424,14 +504,12 @@ public class DexManager {
             methodInfo.put("returnType", method.getReturnType());
             methodInfo.put("accessFlags", method.getAccessFlags());
             
-            // 参数类型
             JSArray params = new JSArray();
             for (CharSequence param : method.getParameterTypes()) {
                 params.put(param.toString());
             }
             methodInfo.put("parameters", params);
             
-            // 方法签名
             StringBuilder sig = new StringBuilder("(");
             for (CharSequence param : method.getParameterTypes()) {
                 sig.append(param);
@@ -441,7 +519,6 @@ public class DexManager {
             
             methods.put(methodInfo);
         }
-
         return methods;
     }
 
@@ -583,12 +660,38 @@ public class DexManager {
     // ==================== 字段操作 ====================
 
     /**
-     * 获取类的所有字段
+     * 获取类的所有字段（优先使用 C++ 实现）
      */
     public JSArray getFields(String sessionId, String className) throws Exception {
         DexSession session = getSession(sessionId);
+        
+        // 优先使用 C++ 实现
+        if (CppDex.isAvailable() && session.dexBytes != null) {
+            try {
+                String jsonResult = CppDex.listFields(session.dexBytes, className);
+                if (jsonResult != null && !jsonResult.contains("\"error\"")) {
+                    org.json.JSONObject cppResult = new org.json.JSONObject(jsonResult);
+                    org.json.JSONArray cppFields = cppResult.optJSONArray("fields");
+                    if (cppFields != null) {
+                        JSArray fields = new JSArray();
+                        for (int i = 0; i < cppFields.length(); i++) {
+                            org.json.JSONObject f = cppFields.getJSONObject(i);
+                            JSObject fieldInfo = new JSObject();
+                            fieldInfo.put("name", f.optString("name"));
+                            fieldInfo.put("type", f.optString("type"));
+                            fieldInfo.put("accessFlags", f.optInt("accessFlags"));
+                            fields.put(fieldInfo);
+                        }
+                        return fields;
+                    }
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "C++ getFields failed, fallback to Java", e);
+            }
+        }
+        
+        // Java 回退实现
         ClassDef classDef = findClass(session, className);
-
         if (classDef == null) {
             throw new IllegalArgumentException("Class not found: " + className);
         }
@@ -1252,6 +1355,14 @@ public class DexManager {
             }
         }
         return content.toString();
+    }
+
+    private byte[] readFileBytes(File file) throws IOException {
+        byte[] bytes = new byte[(int) file.length()];
+        try (FileInputStream fis = new FileInputStream(file)) {
+            fis.read(bytes);
+        }
+        return bytes;
     }
 
     private void deleteRecursive(File file) {
@@ -2901,21 +3012,6 @@ public class DexManager {
         }
         
         return result;
-    }
-
-    /**
-     * 读取文件为字节数组
-     */
-    private byte[] readFileBytes(java.io.File file) throws java.io.IOException {
-        java.io.FileInputStream fis = new java.io.FileInputStream(file);
-        java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
-        byte[] buffer = new byte[8192];
-        int len;
-        while ((len = fis.read(buffer)) != -1) {
-            baos.write(buffer, 0, len);
-        }
-        fis.close();
-        return baos.toByteArray();
     }
 
     /**
