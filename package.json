@@ -1,6 +1,6 @@
 {
   "name": "capacitor-dex-editor",
-  "version": "0.0.71",
+  "version": "0.0.72",
   "description": "Capacitor-plugin-for-editing-DEX-files-in-APK",
   "main": "dist/plugin.cjs.js",
   "module": "dist/esm/index.js",

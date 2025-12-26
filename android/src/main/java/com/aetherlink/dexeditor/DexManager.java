@@ -562,21 +562,42 @@ public class DexManager {
     }
 
     /**
-     * 获取方法的 Smali 代码
+     * 获取方法的 Smali 代码（优先使用 C++ 实现）
      */
     public JSObject getMethodSmali(String sessionId, String className,
                                     String methodName, String methodSignature) throws Exception {
         DexSession session = getSession(sessionId);
         
-        // 获取类的完整 Smali，然后提取方法部分
-        String classSmali = classToSmali(sessionId, className).getString("smali");
+        // 优先使用 C++ 实现
+        if (CppDex.isAvailable() && session.dexBytes != null) {
+            try {
+                String jsonResult = CppDex.getMethodSmali(session.dexBytes, className, methodName, methodSignature);
+                if (jsonResult != null && !jsonResult.contains("\"error\"")) {
+                    org.json.JSONObject cppResult = new org.json.JSONObject(jsonResult);
+                    String smali = cppResult.optString("smali", "");
+                    if (!smali.isEmpty()) {
+                        JSObject result = new JSObject();
+                        result.put("className", className);
+                        result.put("methodName", methodName);
+                        result.put("methodSignature", methodSignature);
+                        result.put("smali", smali);
+                        result.put("engine", "cpp");
+                        return result;
+                    }
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "C++ getMethodSmali failed, fallback to Java", e);
+            }
+        }
         
-        // 简化处理：返回整个类的 Smali（实际应该解析提取特定方法）
+        // Java 回退实现
+        String classSmali = classToSmali(sessionId, className).getString("smali");
         JSObject result = new JSObject();
         result.put("className", className);
         result.put("methodName", methodName);
         result.put("methodSignature", methodSignature);
         result.put("smali", extractMethodSmali(classSmali, methodName, methodSignature));
+        result.put("engine", "java");
         return result;
     }
 
@@ -782,21 +803,40 @@ public class DexManager {
     // ==================== Smali 操作 ====================
 
     /**
-     * 将类转换为 Smali 代码
+     * 将类转换为 Smali 代码（优先使用 C++ 实现）
      */
     public JSObject classToSmali(String sessionId, String className) throws Exception {
         DexSession session = getSession(sessionId);
+        
+        // 优先使用 C++ 实现
+        if (CppDex.isAvailable() && session.dexBytes != null) {
+            try {
+                String jsonResult = CppDex.getClassSmali(session.dexBytes, className);
+                if (jsonResult != null && !jsonResult.contains("\"error\"")) {
+                    org.json.JSONObject cppResult = new org.json.JSONObject(jsonResult);
+                    String smali = cppResult.optString("smali", "");
+                    if (!smali.isEmpty()) {
+                        JSObject result = new JSObject();
+                        result.put("className", className);
+                        result.put("smali", smali);
+                        result.put("engine", "cpp");
+                        return result;
+                    }
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "C++ classToSmali failed, fallback to Java", e);
+            }
+        }
+        
+        // Java 回退实现
         ClassDef classDef = findClass(session, className);
-
         if (classDef == null) {
             throw new IllegalArgumentException("Class not found: " + className);
         }
 
-        // 使用 baksmali 转换
         StringWriter writer = new StringWriter();
         BaksmaliOptions options = new BaksmaliOptions();
         
-        // 创建临时 DEX 只包含该类
         List<ClassDef> singleClass = new ArrayList<>();
         singleClass.add(classDef);
         ImmutableDexFile singleDex = new ImmutableDexFile(
@@ -804,7 +844,6 @@ public class DexManager {
             singleClass
         );
 
-        // 使用临时目录输出
         File tempDir = File.createTempFile("smali_", "_temp");
         tempDir.delete();
         tempDir.mkdirs();
@@ -812,7 +851,6 @@ public class DexManager {
         try {
             Baksmali.disassembleDexFile(singleDex, tempDir, 1, options);
             
-            // 读取生成的 smali 文件
             String smaliPath = className.substring(1, className.length() - 1) + ".smali";
             File smaliFile = new File(tempDir, smaliPath);
             
@@ -821,6 +859,7 @@ public class DexManager {
                 JSObject result = new JSObject();
                 result.put("className", className);
                 result.put("smali", smali);
+                result.put("engine", "java");
                 return result;
             } else {
                 throw new IOException("Failed to generate smali for: " + className);
@@ -887,30 +926,51 @@ public class DexManager {
     // ==================== 搜索操作 ====================
 
     /**
-     * 搜索字符串
+     * 搜索字符串（优先使用 C++ 实现）
      */
     public JSArray searchString(String sessionId, String query, 
                                 boolean regex, boolean caseSensitive) throws Exception {
         DexSession session = getSession(sessionId);
+        
+        // 优先使用 C++ 实现
+        if (CppDex.isAvailable() && session.dexBytes != null && !regex) {
+            try {
+                String jsonResult = CppDex.searchInDex(session.dexBytes, query, "string", caseSensitive, 1000);
+                if (jsonResult != null && !jsonResult.contains("\"error\"")) {
+                    org.json.JSONObject cppResult = new org.json.JSONObject(jsonResult);
+                    org.json.JSONArray cppResults = cppResult.optJSONArray("results");
+                    if (cppResults != null) {
+                        JSArray results = new JSArray();
+                        for (int i = 0; i < cppResults.length(); i++) {
+                            org.json.JSONObject r = cppResults.getJSONObject(i);
+                            JSObject item = new JSObject();
+                            item.put("value", r.optString("value"));
+                            item.put("index", r.optInt("index"));
+                            results.put(item);
+                        }
+                        return results;
+                    }
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "C++ searchString failed, fallback to Java", e);
+            }
+        }
+        
+        // Java 回退实现
         JSArray results = new JSArray();
-
         Pattern pattern = null;
         if (regex) {
             int flags = caseSensitive ? 0 : Pattern.CASE_INSENSITIVE;
             pattern = Pattern.compile(query, flags);
         }
 
-        // 遍历所有类中的字符串引用进行搜索
         Set<String> searchedStrings = new HashSet<>();
         for (ClassDef classDef : session.originalDexFile.getClasses()) {
-            // 类名
             checkAndAddString(classDef.getType(), query, regex, caseSensitive, pattern, searchedStrings, results);
-            // 父类
             if (classDef.getSuperclass() != null) {
                 checkAndAddString(classDef.getSuperclass(), query, regex, caseSensitive, pattern, searchedStrings, results);
             }
         }
-
         return results;
     }
 
@@ -945,16 +1005,41 @@ public class DexManager {
     }
 
     /**
-     * 搜索方法
+     * 搜索方法（优先使用 C++ 实现）
      */
     public JSArray searchMethod(String sessionId, String query) throws Exception {
         DexSession session = getSession(sessionId);
+        
+        // 优先使用 C++ 实现
+        if (CppDex.isAvailable() && session.dexBytes != null) {
+            try {
+                String jsonResult = CppDex.searchInDex(session.dexBytes, query, "method", false, 1000);
+                if (jsonResult != null && !jsonResult.contains("\"error\"")) {
+                    org.json.JSONObject cppResult = new org.json.JSONObject(jsonResult);
+                    org.json.JSONArray cppResults = cppResult.optJSONArray("results");
+                    if (cppResults != null) {
+                        JSArray results = new JSArray();
+                        for (int i = 0; i < cppResults.length(); i++) {
+                            org.json.JSONObject r = cppResults.getJSONObject(i);
+                            JSObject item = new JSObject();
+                            item.put("className", r.optString("className"));
+                            item.put("methodName", r.optString("name"));
+                            item.put("returnType", r.optString("returnType", ""));
+                            results.put(item);
+                        }
+                        return results;
+                    }
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "C++ searchMethod failed, fallback to Java", e);
+            }
+        }
+        
+        // Java 回退实现
         JSArray results = new JSArray();
         String queryLower = query.toLowerCase();
-
         for (ClassDef classDef : session.originalDexFile.getClasses()) {
             if (session.removedClasses.contains(classDef.getType())) continue;
-
             for (Method method : classDef.getMethods()) {
                 if (method.getName().toLowerCase().contains(queryLower)) {
                     JSObject item = new JSObject();
@@ -965,21 +1050,45 @@ public class DexManager {
                 }
             }
         }
-
         return results;
     }
 
     /**
-     * 搜索字段
+     * 搜索字段（优先使用 C++ 实现）
      */
     public JSArray searchField(String sessionId, String query) throws Exception {
         DexSession session = getSession(sessionId);
+        
+        // 优先使用 C++ 实现
+        if (CppDex.isAvailable() && session.dexBytes != null) {
+            try {
+                String jsonResult = CppDex.searchInDex(session.dexBytes, query, "field", false, 1000);
+                if (jsonResult != null && !jsonResult.contains("\"error\"")) {
+                    org.json.JSONObject cppResult = new org.json.JSONObject(jsonResult);
+                    org.json.JSONArray cppResults = cppResult.optJSONArray("results");
+                    if (cppResults != null) {
+                        JSArray results = new JSArray();
+                        for (int i = 0; i < cppResults.length(); i++) {
+                            org.json.JSONObject r = cppResults.getJSONObject(i);
+                            JSObject item = new JSObject();
+                            item.put("className", r.optString("className"));
+                            item.put("fieldName", r.optString("name"));
+                            item.put("fieldType", r.optString("type", ""));
+                            results.put(item);
+                        }
+                        return results;
+                    }
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "C++ searchField failed, fallback to Java", e);
+            }
+        }
+        
+        // Java 回退实现
         JSArray results = new JSArray();
         String queryLower = query.toLowerCase();
-
         for (ClassDef classDef : session.originalDexFile.getClasses()) {
             if (session.removedClasses.contains(classDef.getType())) continue;
-
             for (Field field : classDef.getFields()) {
                 if (field.getName().toLowerCase().contains(queryLower)) {
                     JSObject item = new JSObject();
@@ -990,8 +1099,107 @@ public class DexManager {
                 }
             }
         }
-
         return results;
+    }
+
+    // ==================== 交叉引用分析（C++ 实现）====================
+
+    /**
+     * 查找方法的交叉引用
+     */
+    public JSObject findMethodXrefs(String sessionId, String className, String methodName) throws Exception {
+        DexSession session = getSession(sessionId);
+        
+        if (!CppDex.isAvailable() || session.dexBytes == null) {
+            throw new UnsupportedOperationException("C++ library not available for xref analysis");
+        }
+        
+        String jsonResult = CppDex.findMethodXrefs(session.dexBytes, className, methodName);
+        if (jsonResult == null || jsonResult.contains("\"error\"")) {
+            throw new Exception("Failed to find method xrefs");
+        }
+        
+        org.json.JSONObject cppResult = new org.json.JSONObject(jsonResult);
+        JSObject result = new JSObject();
+        result.put("className", className);
+        result.put("methodName", methodName);
+        
+        org.json.JSONArray xrefs = cppResult.optJSONArray("xrefs");
+        JSArray xrefArray = new JSArray();
+        if (xrefs != null) {
+            for (int i = 0; i < xrefs.length(); i++) {
+                org.json.JSONObject x = xrefs.getJSONObject(i);
+                JSObject xref = new JSObject();
+                xref.put("callerClass", x.optString("callerClass"));
+                xref.put("callerMethod", x.optString("callerMethod"));
+                xref.put("offset", x.optInt("offset"));
+                xrefArray.put(xref);
+            }
+        }
+        result.put("xrefs", xrefArray);
+        result.put("count", xrefArray.length());
+        return result;
+    }
+
+    /**
+     * 查找字段的交叉引用
+     */
+    public JSObject findFieldXrefs(String sessionId, String className, String fieldName) throws Exception {
+        DexSession session = getSession(sessionId);
+        
+        if (!CppDex.isAvailable() || session.dexBytes == null) {
+            throw new UnsupportedOperationException("C++ library not available for xref analysis");
+        }
+        
+        String jsonResult = CppDex.findFieldXrefs(session.dexBytes, className, fieldName);
+        if (jsonResult == null || jsonResult.contains("\"error\"")) {
+            throw new Exception("Failed to find field xrefs");
+        }
+        
+        org.json.JSONObject cppResult = new org.json.JSONObject(jsonResult);
+        JSObject result = new JSObject();
+        result.put("className", className);
+        result.put("fieldName", fieldName);
+        
+        org.json.JSONArray xrefs = cppResult.optJSONArray("xrefs");
+        JSArray xrefArray = new JSArray();
+        if (xrefs != null) {
+            for (int i = 0; i < xrefs.length(); i++) {
+                org.json.JSONObject x = xrefs.getJSONObject(i);
+                JSObject xref = new JSObject();
+                xref.put("accessorClass", x.optString("accessorClass"));
+                xref.put("accessorMethod", x.optString("accessorMethod"));
+                xref.put("accessType", x.optString("accessType"));
+                xrefArray.put(xref);
+            }
+        }
+        result.put("xrefs", xrefArray);
+        result.put("count", xrefArray.length());
+        return result;
+    }
+
+    // ==================== Smali 转 Java（C++ 实现）====================
+
+    /**
+     * 将 Smali 代码转换为 Java 伪代码
+     */
+    public JSObject smaliToJava(String sessionId, String className) throws Exception {
+        DexSession session = getSession(sessionId);
+        
+        if (!CppDex.isAvailable() || session.dexBytes == null) {
+            throw new UnsupportedOperationException("C++ library not available for smali to java conversion");
+        }
+        
+        String jsonResult = CppDex.smaliToJava(session.dexBytes, className);
+        if (jsonResult == null || jsonResult.contains("\"error\"")) {
+            throw new Exception("Failed to convert smali to java");
+        }
+        
+        org.json.JSONObject cppResult = new org.json.JSONObject(jsonResult);
+        JSObject result = new JSObject();
+        result.put("className", className);
+        result.put("java", cppResult.optString("java", ""));
+        return result;
     }
 
     // ==================== 工具操作 ====================

@@ -307,6 +307,31 @@ public class DexEditorPluginPlugin extends Plugin {
                 ));
                 break;
 
+            // ============ 交叉引用分析（C++ 实现）============
+            case "findMethodXrefs":
+                result.put("data", dexManager.findMethodXrefs(
+                    params.getString("sessionId"),
+                    params.getString("className"),
+                    params.getString("methodName")
+                ));
+                break;
+
+            case "findFieldXrefs":
+                result.put("data", dexManager.findFieldXrefs(
+                    params.getString("sessionId"),
+                    params.getString("className"),
+                    params.getString("fieldName")
+                ));
+                break;
+
+            // ============ Smali 转 Java（C++ 实现）============
+            case "smaliToJava":
+                result.put("data", dexManager.smaliToJava(
+                    params.getString("sessionId"),
+                    params.getString("className")
+                ));
+                break;
+
             // ============ 工具操作 ============
             case "fixDex":
                 dexManager.fixDex(
